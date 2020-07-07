@@ -1813,7 +1813,7 @@ begin
               Assert(Dependencies[J] < UInt32(FCVTypes.Count));
               // So this logic is goofy, but we push on type dependencies under the following
               // conditions:
-              // 1) The dependency is a non-basic type (anything with index over $1000)
+              // 1) The dependency is a non-basic type (anything with index $1000 and over)
               // 2) One of the following:
               //   a) The dependency is not already in the stack to be processed
               //   b) The current type is an LF_ARGLIST type and hasn't already been translated.
@@ -1822,9 +1822,6 @@ begin
               //      Depending on how we got here, it *may* result in duplicates being pushed on to
               //      the TypesToProcess stack, but that's okay because duplicates will be ignored
               //      in the check following the TypesToProcess.Peek() call above.
-//              if (Dependencies[J] >= $1000) and
-//                 (not TranslatedTypes.ContainsKey(Dependencies[J])) then
-//                TypesToProcess.Push(Dependencies[J]);
               if (Dependencies[J] >= $1000) and
                  ((not TranslatedTypes.TryGetValue(Dependencies[J], newType)) or
                   ((FCVTypes[currentType]^.leaf = LF_ARGLIST) and (newType = 0))) then
@@ -1857,61 +1854,6 @@ begin
     TypesToProcess.Free;
     TranslatedTypes.Free;
   end;
-
-
-  // Old Code
-  {NewTypeList := TList<PTYPTYPE>.Create;
-  for I := 0 to $1000 - 1 do // add in basic types with nil PTYPTYPE
-    NewTypeList.Add(nil);
-  TranslatedTypes := TDictionary<CV_typ_t, CV_typ_t>.Create;
-  TypesToProcess := nil;
-  try
-    // Sort types in reverse dependency order and keep track of changes
-    TypesToProcess := TStack<UInt32>.Create;
-    if FCVTypes.Count > $1000 then begin // process only non-basic types
-      for I := FCVTypes.Count - 1 downto $1000 do
-        TypesToProcess.Push(I);
-
-      while TypesToProcess.Count > 0 do begin
-        currentType := TypesToProcess.Peek; // Don't pop until we are ready to process it, or if we already have
-        if (not TranslatedTypes.TryGetValue(currentType, newType)) or (newType = 0) then begin
-          TranslatedTypes.AddOrSetValue(currentType, 0); // Not fully defined, but used to break dependency cycles
-          Dependencies := GetTypeDependencies(FCVTypes[currentType]);
-          PrevCount := TypesToProcess.Count;
-          if Length(Dependencies) > 0 then
-            for J := 0 to Length(Dependencies) - 1 do begin
-              Assert(Dependencies[J] < UInt32(FCVTypes.Count));
-              if (Dependencies[J] >= $1000) and
-                 (not TranslatedTypes.ContainsKey(Dependencies[J])) then
-                TypesToProcess.Push(Dependencies[J]);
-            end;
-          if PrevCount = TypesToProcess.Count then begin // no unhandled dependencies
-            TypesToProcess.Pop;
-            TranslatedTypes[currentType] := NewTypeList.Add(FCVTypes[currentType]);
-          end;
-        end
-        else
-          TypesToProcess.Pop;
-      end;
-    end;
-    NewTypeList := AtomicExchange(Pointer(FCVTypes), Pointer(NewTypeList));
-
-    // Update types within the types themselves
-    if FCVTypes.Count > $1000 then // process only non-basic types
-      for I := $1000 to FCVTypes.Count - 1 do
-        TranslateTypes(FCVTypes[I], TranslatedTypes);
-
-    // Now update type conversion list
-    if FTypeConversions.Count > $1000 then
-      for TDSType in FTypeConversions.Keys do
-        if (TDSType >= $1000) and (FTypeConversions[TDSType] >= $1000) then begin
-          FTypeConversions[TDSType] := TranslatedTypes[FTypeConversions[TDSType]];
-        end;
-  finally
-    NewTypeList.Free;
-    TypesToProcess.Free;
-    TranslatedTypes.Free;
-  end;}
 
   ConsolidateTypes;
 {$POINTERMATH OFF}
