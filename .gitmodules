@@ -6,5 +6,5 @@
 	url = https://github.com/project-jedi/jcl.git
 [submodule "LLVMPDBCOM"]
 	path = LLVMPDBCOM
-	url = ./LLVMPDBCOM
+	url = https://github.com/powerworld/LLVMPDBCOM.git
 	branch = master
