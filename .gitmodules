@@ -1,0 +1,10 @@
+[submodule "VSoft.CommandLineParser"]
+	path = VSoft.CommandLineParser
+	url = https://github.com/VSoftTechnologies/VSoft.CommandLineParser.git
+[submodule "jcl"]
+	path = jcl
+	url = https://github.com/project-jedi/jcl.git
+[submodule "LLVMPDBCOM"]
+	path = LLVMPDBCOM
+	url = ./LLVMPDBCOM
+	branch = master
