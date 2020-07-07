@@ -7,6 +7,16 @@ uses
 
 type
   TTDSParser = class
+  public type
+    TSourceLine = record
+      module: Integer;
+      filename: string;
+      seg: UInt16;
+      offset: UInt32;
+      linenumber: UInt32;
+      constructor Create(Amodule: Integer; Afilename: string; Aseg: UInt16; Aoffset,
+        Alinenumber: UInt32);
+    end;
   private const
     POOL_DELTA = 256 * 1024;
   private
@@ -17,20 +27,13 @@ type
     FAlignSymbolsBases: TList<Pointer>;
     FAlignSymbols: TObjectList<TList<PTDS_SYMTYPE>>;
     FSourceModules: TList<PTDS_SourceModuleSectionHeader>;
+    FSourceModulesSize: TList<UInt32>;
     FGlobalSymbols: TList<PTDS_SYMTYPE>;
     FGlobalTypes: TList<PTDS_TYPTYPE>;
     FNames: TList<PAnsiChar>;
-//    FBufferPool: TObjectList<TMemoryStream>;
-//    FCurrentBuffer: TMemoryStream;
-//    FFixedUpTypeData: TMemoryStream;
-//    FFixedUpAlignSymData: TObjectList<TMemoryStream>;
-//    FFixedUpGlobalSymData: TMemoryStream;
+    FSourceLines: TObjectList<TList<TSourceLine>>;
     procedure ParseTDSData;
-//    procedure SortTypesAndFixupSymbols;
-//    procedure InitNewPoolBuffer;
-//    function PoolSize: Int64;
-//    procedure CheckPool(Size: Int64);
-//    procedure ClearPool;
+    procedure FixupLineInfo;
     function LfaToVa(Lfa: NativeInt): Pointer;
   public
     constructor Create(const ATD32Data: TCustomMemoryStream); // Data mustn't be freed before the class is destroyed
@@ -45,6 +48,7 @@ type
     property GlobalSymbols: TList<PTDS_SYMTYPE> read FGlobalSymbols;
     property GlobalTypes: TList<PTDS_TYPTYPE> read FGlobalTypes;
     property Names: TList<PAnsiChar> read FNames;
+    property SourceLines: TObjectList<TList<TSourceLine>> read FSourceLines;
   end;
 
   // Adapted from the Project Jedi TJclPeBorTD32Image
@@ -69,10 +73,20 @@ type
 implementation
 
 uses
-  Winapi.Windows, JclSysUtils, JclFileUtils, TD32ToPDBResources, TDSUtils;
+  System.Generics.Defaults, Winapi.Windows, JclSysUtils, JclFileUtils, TD32ToPDBResources, TDSUtils;
 
 const
   TurboDebuggerSymbolExt = '.tds';
+
+constructor TTDSParser.TSourceLine.Create(Amodule: Integer; Afilename: string; Aseg: UInt16; Aoffset,
+  Alinenumber: UInt32);
+begin
+  module := Amodule;
+  filename := Afilename;
+  seg := Aseg;
+  offset := Aoffset;
+  linenumber := Alinenumber;
+end;
 
 procedure TTDSParser.ParseTDSData;
 var
@@ -124,11 +138,16 @@ begin
           end;
         end;
         TDS_SUBSECTION_TYPE_SOURCE_MODULE: begin
-          if FSourceModules = nil then
+          if FSourceModules = nil then begin
             FSourceModules := TList<PTDS_SourceModuleSectionHeader>.Create;
-          if FSourceModules.Count <= PDirHeader.entries[I].iMod then
+            FSourceModulesSize := TList<UInt32>.Create;
+          end;
+          if FSourceModules.Count <= PDirHeader.entries[I].iMod then begin
             FSourceModules.Count := PDirHeader.entries[I].iMod + 1;
+            FSourceModulesSize.Count := PDirHeader.entries[I].iMod + 1;
+          end;
           FSourceModules[PDirHeader.entries[I].iMod] := LfaToVa(PDirHeader.entries[I].lfo);
+          FSourceModulesSize[PDirHeader.entries[I].iMod] := PDirHeader.entries[I].cb;
         end;
         TDS_SUBSECTION_TYPE_GLOBAL_SYMBOLS: begin
           // we don't really care about the header
@@ -178,209 +197,113 @@ begin
     else
       Break;
   end;
-
-  // Organize types in reverse dependency order as much as possible as this is the preferred
-  // ordering for CodeView types. Once done, fixup symbols accordingly.
-//  SortTypesAndFixupSymbols;
 {$POINTERMATH OFF}
 end;
 
-(*procedure TTDSParser.SortTypesAndFixupSymbols;
-const
-  TypeStorageDelta = 65536;
+procedure TTDSParser.FixupLineInfo;
+type
+  TContribLineNumberInfo = record
+    prevlinenumber,
+    wrapnum: Integer;
+  end;
 var
-  I, J: UInt32;
-  NewTypeList: TList<PTDS_TYPTYPE>;
-  TranslatedTypes: TDictionary<TDS_typ_t, TDS_typ_t>;
-  TypesToProcess: TStack<UInt32>;
-  Dependencies: TArray<TDS_typ_t>;
-  CurrentType: TDS_typ_t;
-  PrevCount: Integer;
-  TypeSize: UInt16;
-  SymSize: UInt16;
-  NewType: PTDS_TYPTYPE;
-  NewSym: PTDS_SYMTYPE;
-  LogStream: TStreamWriter;
+  I, L: Integer;
+  J, K: UInt16;
+  srcMod: PTDS_SourceModuleSectionHeader;
+  srcModFile: PTDS_SourceFileEntry;
+  srcModFileSeg,
+  srcModEnd,
+  srcModFileEnd,
+  srcModFileSegEnd: PTDS_SegmentLineInfo;
+  lni: TContribLineNumberInfo;
+  filename: string;
+  seg: UInt16;
+  PrevLineNumberInfo: TDictionary<string, TContribLineNumberInfo>;
 begin
 {$POINTERMATH ON}
-  LogStream := TStreamWriter.Create(TFileStream.Create('Reorderings.txt', fmCreate or fmShareDenyWrite));
-  LogStream.OwnStream;
-  NewTypeList := TList<PTDS_TYPTYPE>.Create;
-  for I := 0 to $1000 - 1 do // add in basic types with nil PTYPTYPE
-    NewTypeList.Add(nil);
-  TranslatedTypes := TDictionary<TDS_typ_t, TDS_typ_t>.Create;
-  TypesToProcess := nil;
+  PrevLineNumberInfo := TDictionary<string, TContribLineNumberInfo>.Create;
   try
-    // Sort types in reverse dependency order and keep track of changes
-    TypesToProcess := TStack<UInt32>.Create;
-    if FGlobalTypes.Count > $1000 then // process only non-basic types
-      for I := $1000 to FGlobalTypes.Count - 1 do
-        if not TranslatedTypes.ContainsKey(I) then begin
-          TypesToProcess.Push(I);
-          while TypesToProcess.Count > 0 do begin
-            PrevCount := TypesToProcess.Count;
-            CurrentType := TypesToProcess.Peek;
-            TranslatedTypes.AddOrSetValue(CurrentType, 0); // Placeholder...breaks dependency cycles
-            Dependencies := GetTypeDependencies(FGlobalTypes[CurrentType]);
-            if Length(Dependencies) > 0 then // need this since J is unsigned
-              for J := 0 to Length(Dependencies) - 1 do begin
-                Assert(Dependencies[J] < UInt32(FGlobalTypes.Count));
-                if (Dependencies[J] >= $1000) and
-                   (not TranslatedTypes.ContainsKey(Dependencies[J])) then
-                  TypesToProcess.Push(Dependencies[J]);
+    for I := 0 to FSourceModules.Count - 1 do begin
+      if FSourceLines = nil then
+        FSourceLines := TObjectList<TList<TSourceLine>>.Create;
+      FSourceLines.Add(
+        TList<TSourceLine>.Create(
+          TComparer<TSourceLine>.Construct(
+            function(const Left, Right: TSourceLine): Integer
+            begin
+              if Left.seg < Right.seg then Result := -1
+              else if Left.Seg > Right.seg then Result := 1
+              else if Left.offset < Right.offset then Result := -1
+              else if Left.offset > Right.offset then Result := 1
+              else Result := 0;
+            end)));
+      srcMod := FSourceModules[I];
+      srcModEnd := Pointer(NativeUInt(FSourceModules[I]) + FSourceModulesSize[I]);
+      if (srcMod <> nil) and (srcMod.cFile <> 0) then begin
+        for J := 0 to srcMod.cFile - 1 do begin
+          srcModFile := srcMod.GetbaseSrcFilePointer(J);
+          if (J < (srcMod.cFile - 1)) and (srcMod.GetbaseSrcFilePointer(J + 1).cSeg <> 0) then
+            srcModFileEnd := srcMod.GetbaseSrcFilePointer(J + 1).getbaseSrcLnPointer(srcMod, 0)
+          else
+            srcModFileEnd := srcModEnd;
+          filename := string(UTF8String(FNames[srcModFile.name]));
+          if srcModFile.cSeg <> 0 then begin
+            // Since we're on a single file now and line numbers can wrap around 65536, keep track
+            // of previous line numbers. To handle line number wrapping we use the following logic:
+            // 1) If we wrap from huge to small and the difference is greater than half the range,
+            //    increment the line count offset.
+            // 2) If we wrap from small to huge and the difference is greater than half the range,
+            //    decrement the line count offset.
+            // The rationale is that we should never see a loop spanning 32k lines and it's
+            // extremely rare for line numbers to decrease, unless in a loop. This should handle all
+            // line number increases and decreases with aplomb.
+            //
+            // Also, since contributions from files can be split up because of file inclusions, we
+            // need to keep track of previous line numbers and wrap counts from previous contributions
+            // from the same file.
+            if not PrevLineNumberInfo.TryGetValue(filename, lni) then begin
+              lni.prevlinenumber := 0;
+              lni.wrapnum := 0;
+            end;
+            for K := 0 to srcModFile.cSeg - 1 do begin
+              srcModFileSeg := srcModFile.getbaseSrcLnPointer(srcMod, K);
+              if K < (srcModFile.cSeg - 1) then
+                srcModFileSegEnd := srcModFile.getbaseSrcLnPointer(srcMod, K + 1)
+              else
+                srcModFileSegEnd := srcModFileEnd;
+              seg := srcModFileSeg.seg;
+              // Because of the way this whole section is structured, it's possible for line info to
+              // exceed 65536 entries, so we just ensure that the line number pointer is strictly less
+              // than the srcModFileSegEnd.
+              L := 0;
+              while NativeUInt(@srcModFileSeg.linenumber[L]) < NativeUInt(srcModFileSegEnd) do begin
+                // This is where the previously described goofy line number wrapping logic comes
+                // into play:
+                if      ((lni.prevlinenumber and $8000) = $8000) and
+                        ((srcModFileSeg.linenumber[L] and $8000) = $0000) and
+                        ((lni.prevlinenumber - srcModFileSeg.linenumber[L]) > $8000) then
+                  Inc(lni.wrapnum)
+                else if ((lni.prevlinenumber and $8000) = $0000) and
+                        ((srcModFileSeg.linenumber[L] and $8000) = $8000) and
+                        ((srcModFileSeg.linenumber[L] - lni.prevlinenumber) > $8000) then
+                  Dec(lni.wrapnum);
+                FSourceLines[I].Add(TSourceLine.Create(I, filename, seg, srcModFileSeg.offset[L],
+                  srcModFileSeg.linenumber[L] + lni.wrapnum * 65536));
+                lni.prevlinenumber := srcModFileSeg.linenumber[L];
+                Inc(L);
               end;
-            if PrevCount = TypesToProcess.Count then begin // no unhandled dependencies
-              TypesToProcess.Pop;
-              TranslatedTypes[CurrentType] := NewTypeList.Add(FGlobalTypes[CurrentType]);
-              LogStream.WriteLine('$%.8x -> $%.8x', [CurrentType, NewTypeList.Count - 1]);
             end;
+            PrevLineNumberInfo.AddOrSetValue(filename, lni);
           end;
         end;
-    NewTypeList := AtomicExchange(Pointer(FGlobalTypes), Pointer(NewTypeList));
-
-    // Update types within the types themselves
-    if FGlobalTypes.Count > $1000 then begin // process only non-basic types
-      for I := $1000 to FGlobalTypes.Count - 1 do begin
-        // Copy type over to pool
-        with FGlobalTypes[I]^ do begin
-          TypeSize := len + SizeOf(len);
-          CheckPool(TypeSize);
-          NewType := Pointer(PUInt8(FCurrentBuffer.Memory) + FCurrentBuffer.Position);
-          FCurrentBuffer.Position := FCurrentBuffer.Position + TypeSize;
-        end;
-        Move(FGlobalTypes[I]^, NewType^, TypeSize);
-        // Modify type as necessary
-        TranslateTDS2TDSTypes(NewType, TranslatedTypes);
-        // Update global type list with copied and modified type
-        FGlobalTypes[I] := NewType;
       end;
-    end;
-
-    if FGlobalTypes.Count > $1000 then begin // process only non-basic types
-      // Move pool types over to a more permanent, contiguous buffer
-      FFixedUpTypeData := TMemoryStream.Create;
-      FFixedUpTypeData.Size := PoolSize;
-      for I := $1000 to FGlobalTypes.Count - 1 do begin
-        with FGlobalTypes[I]^ do begin
-          TypeSize := len + SizeOf(len);
-          CheckPool(TypeSize);
-          NewType := Pointer(PUInt8(FFixedUpTypeData.Memory) + FFixedUpTypeData.Position);
-          FFixedUpTypeData.Position := FFixedUpTypeData.Position + TypeSize;
-        end;
-        Move(FGlobalTypes[I]^, NewType^, TypeSize);
-        FGlobalTypes[I] := NewType;
-      end;
-      ClearPool;
-    end;
-
-    // Update types in align symbols
-    if FAlignSymbols.Count > 0 then begin // need this because I is unsigned
-      FFixedUpAlignSymData.Count := FAlignSymbols.Count;
-      for I := 0 to FAlignSymbols.Count - 1 do begin
-        if (FAlignSymbols[I] <> nil) and (FAlignSymbols[I].Count > 0) then begin // need this because J is unsigned
-          for J := 0 to FAlignSymbols[I].Count - 1 do begin
-            // Copy symbol over to pool
-            with FAlignSymbols[I][J]^ do begin
-              SymSize := reclen + SizeOf(reclen);
-              CheckPool(SymSize);
-              NewSym := Pointer(PUInt8(FCurrentBuffer.Memory) + FCurrentBuffer.Position);
-              FCurrentBuffer.Position := FCurrentBuffer.Position + SymSize;
-            end;
-            Move(FAlignSymbols[I][J]^, NewSym^, SymSize);
-            // Modify symbol as necessary
-            TranslateTDS2TDSTypes(NewSym, TranslatedTypes);
-            // Update align symbol list with copied and modified symbol
-            FAlignSymbols[I][J] := NewSym;
-          end;
-        end;
-
-        if (FAlignSymbols[I] <> nil) and (FAlignSymbols[I].Count > 0) then begin // need this because J is unsigned
-          // Move pool symbols to more permanent, contiguous buffer
-          FFixedUpAlignSymData[I] := TMemoryStream.Create;
-          FFixedUpAlignSymData[I].Size := PoolSize;
-          FAlignSymbolsBases[I] := FFixedUpAlignSymData[I].Memory;
-          for J := 0 to FAlignSymbols[I].Count - 1 do begin
-            with FAlignSymbols[I][J]^ do begin
-              SymSize := reclen + SizeOf(reclen);
-              CheckPool(SymSize);
-              NewSym := Pointer(PUInt8(FFixedUpAlignSymData[I].Memory) + FFixedUpAlignSymData[I].Position);
-              FFixedUpAlignSymData[I].Position := FFixedUpAlignSymData[I].Position + SymSize;
-            end;
-            Move(FAlignSymbols[I][J]^, NewSym^, SymSize);
-            FAlignSymbols[I][J] := NewSym;
-          end;
-        end;
-        ClearPool;
-      end;
-    end;
-    // Update types in global symbols
-    if FGlobalSymbols.Count > 0 then begin // need this because I is unsigned
-      for I := 0 to FGlobalSymbols.Count - 1 do begin
-        // Copy symbol over to pool
-        with FGlobalSymbols[I]^ do begin
-          SymSize := reclen + SizeOf(reclen);
-          CheckPool(SymSize);
-          NewSym := Pointer(PUInt8(FCurrentBuffer.Memory) + FCurrentBuffer.Position);
-          FCurrentBuffer.Position := FCurrentBuffer.Position + SymSize;
-        end;
-        Move(FGlobalSymbols[I]^, NewSym^, SymSize);
-        // Modify symbol as necessary
-        TranslateTDS2TDSTypes(NewSym, TranslatedTypes);
-        // Update global symbol list with copied and modified symbol
-        FGlobalSymbols[I] := NewSym;
-      end;
-    end;
-
-    if FGlobalSymbols.Count > 0 then begin // need this because I is unsigned
-      // Move pool symbols to more permanent, contiguous buffer
-      FFixedUpGlobalSymData := TMemoryStream.Create;
-      FFixedUpGlobalSymData.Size := PoolSize;
-      for I := 0 to FGlobalSymbols.Count - 1 do begin
-        with FGlobalSymbols[I]^ do begin
-          SymSize := reclen + SizeOf(reclen);
-          CheckPool(SymSize);
-          NewSym := Pointer(PUInt8(FFixedUpGlobalSymData.Memory) + FFixedUpGlobalSymData.Position);
-          FFixedUpGlobalSymData.Position := FFixedUpGlobalSymData.Position + SymSize;
-        end;
-        Move(FGlobalSymbols[I]^, NewSym^, SymSize);
-        FGlobalSymbols[I] := NewSym;
-      end;
-      ClearPool;
+      FSourceLines[I].Sort;
     end;
   finally
-    LogStream.Free;
-    NewTypeList.Free; // Now should hold the old FGlobalTypes
-    TypesToProcess.Free;
-    TranslatedTypes.Free;
+    PrevLineNumberInfo.Free;
   end;
 {$POINTERMATH OFF}
-end;*)
-
-//procedure TTDSParser.InitNewPoolBuffer;
-//begin
-//  FCurrentBuffer := TMemoryStream.Create;
-//  FCurrentBuffer.Size := POOL_DELTA;
-//  FBufferPool.Add(FCurrentBuffer);
-//end;
-
-//function TTDSParser.PoolSize: Int64;
-//begin
-//  Result := FBufferPool.Count * POOL_DELTA;
-//end;
-//
-//procedure TTDSParser.CheckPool(Size: Int64);
-//begin
-//  Assert(Size <= POOL_DELTA);
-//  if (FBufferPool[FBufferPool.Count - 1].Position + Size) >=
-//     FBufferPool[FBufferPool.Count - 1].Size then
-//    InitNewPoolBuffer;
-//end;
-//
-//procedure TTDSParser.ClearPool;
-//begin
-//  FBufferPool.Clear;
-//  InitNewPoolBuffer;
-//end;
+end;
 
 function TTDSParser.LfaToVa(Lfa: NativeInt): Pointer;
 begin
@@ -395,29 +318,24 @@ begin
   inherited Create;
   FData := ATD32Data;
   FBase := FData.Memory;
-//  FBufferPool := TObjectList<TMemoryStream>.Create;
-//  FCurrentBuffer := TMemoryStream.Create;
-//  FCurrentBuffer.Size := POOL_DELTA;
-//  FBufferPool.Add(FCurrentBuffer);
   FValidData := IsTD32DebugInfoValid(FBase, FData.Size);
-//  FFixedUpAlignSymData := TObjectList<TMemoryStream>.Create;
-  if FValidData then
+  if FValidData then begin
     ParseTDSData;
+    FixupLineInfo;
+  end;
 end;
 
 destructor TTDSParser.Destroy;
 begin
+  FSourceLines.Free;
   FModules.Free;
   FAlignSymbolsBases.Free;
   FAlignSymbols.Free;
+  FSourceModulesSize.Free;
   FSourceModules.Free;
   FGlobalSymbols.Free;
   FGlobalTypes.Free;
   FNames.Free;
-//  FBufferPool.Free;
-//  FFixedUpTypeData.Free;
-//  FFixedUpAlignSymData.Free;
-//  FFixedUpGlobalSymData.Free;
   inherited Destroy;
 end;
 

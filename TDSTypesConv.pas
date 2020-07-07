@@ -74,6 +74,13 @@ type
   TTDSToPDBTypesConverter = class
   private const
     POOL_DELTA = 256 * 1024;
+  private type
+    TPredefinedTypes = record
+      ShortStr,
+      AnsiStr,
+      WideStr,
+      UnicodeStr: CV_typ_t;
+    end;
   private
     FTDSParser: TTDSParser;
     FBufferPool: TObjectList<TMemoryStream>;
@@ -88,15 +95,17 @@ type
     FTVarDataType: CV_typ_t;
     FCVTypeFixups: TList<PCV_typ_t>;
     FCVTypeConvFixups: TList<TDS_typ_t>;
+    FPredefinedTypes: TPredefinedTypes;
     procedure AddConverter(leaf: UInt16; name: string; converter: TTDSToCVTypeConverterBase);
     procedure AddConverters;
-    function AddType(Size: UInt16; out pTyp: PTYPTYPE): CV_typ_t;
+    function AllocType(Size: UInt32): PTYPTYPE;
+    function AddType(Size: UInt32; out pTyp: PTYPTYPE): CV_typ_t;
     procedure Convert;
-    procedure OnTypeFixupAdd(Sender: TObject; const Item: PCV_typ_t;
-      Action: TCollectionNotification);
+    procedure ConsolidateTypes;
   public
     constructor Create(TDSParser: TTDSParser);
     destructor Destroy; override;
+    procedure UpdateUDTNames(NameDict: TDictionary<CV_typ_t, UTF8String>);
     property CVTypes: TList<PTYPTYPE> read FCVTypes;
     property CVTypeData: TMemoryStream read FTypeData;
     property TypeConversions: TDictionary<TDS_typ_t, CV_typ_t> read FTypeConversions;
@@ -305,6 +314,14 @@ begin
     System.AnsiStrings.StrCopy(PAnsiChar(dataptr), name);
 end;
 
+function CLASS_STRUCTURE_Instsize(pInLeaf: PlfClass): UInt16;
+var
+  outInstSize: UInt64;
+begin
+  LeafUnsignedValue(@pInLeaf.data[0], outInstSize);
+  Result := outInstSize;
+end;
+
 function TTDSToCVConverterCLASS.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 var
   pInLeaf: PTDS_lfClass;
@@ -337,33 +354,26 @@ begin
     pFieldTypeEnd := TDS_NextType(pTempType);
     pFieldLeaf := @pTempType.leaf;
     pFieldEntryLeaf := @pFieldLeaf.data[0];
-    pMetaClassLeaf := nil;
     vshape := 0;
     while NativeUInt(pFieldEntryLeaf) < NativeUInt(pFieldTypeEnd) do begin
       if pFieldEntryLeaf.leaf = TDS_LF_VFUNCTAB then begin
         pTempType := FTypesConverter.FTDSParser.GlobalTypes[PTDS_lfVFuncTab(pFieldEntryLeaf).&type];
-        if pTempType.leaf = TDS_LF_VTSHAPE then
+        if pTempType.leaf = TDS_LF_VTSHAPE then // Interface & Object types
           vshape := PTDS_lfVFuncTab(pFieldEntryLeaf).&type
-        else begin
+        else begin // Class types
           Assert((pTempType <> nil) and (pTempType.leaf = TDS_LF_DMETACLASS));
           pMetaClassLeaf := @pTempType.leaf;
+          vshape := pMetaClassLeaf.shape;
         end;
         Break;
       end;
       pFieldEntryLeaf := NextField(pFieldEntryLeaf);
     end;
-    if vshape = 0 then begin
-      Assert(pMetaClassLeaf <> nil);
-      vshape := pMetaClassLeaf.shape;
-    end;
-    Assert(vshape <> 0);
   end
   else
     vshape := 0;
 
-  // If this is a class type, it should *always* have a vshape type. If this is a structure type, it
-  // should *never* have a vshape type.
-  Assert(((outLeaf = LF_CLASS) and (vshape <> 0)) or ((outLeaf = LF_STRUCTURE) and (vshape = 0)));
+  // vshape may not be present in old Delphi Object (not Class!) types
   CLASS_STRUCTURE_Fill(
     @pOutTyp.leaf,
     outLeaf,
@@ -381,7 +391,8 @@ begin
     FTypesConverter.FTObjectType := inTypIdx
   // Keep track of TVarData type for future use
   else if (FTypesConverter.FTVarDataType = 0) and (outLeaf = LF_STRUCTURE) and
-     (System.AnsiStrings.StrComp(FTypesConverter.FTDSParser.Names[pInLeaf.name], 'TVarData') = 0) then
+     ((System.AnsiStrings.StrComp(FTypesConverter.FTDSParser.Names[pInLeaf.name], 'TVarData') = 0) or
+      (System.AnsiStrings.StrComp(FTypesConverter.FTDSParser.Names[pInLeaf.name], '_ZTRN8Pwrworld8TVarDataE') = 0)) then
     FTypesConverter.FTVarDataType := inTypIdx;
 end;
 
@@ -603,9 +614,14 @@ begin
   PadBuffer(Result);
 end;
 
-function FIELDLIST_Size(fieldListSize: UInt16): UInt16;
+function FIELDLIST_Size_BASE: UInt16;
 begin
   Result := SizeOf(lfFieldList) - SizeOf(PlfFieldList(nil).data);
+end;
+
+function FIELDLIST_Size(fieldListSize: UInt16): UInt16;
+begin
+  Result := FIELDLIST_Size_BASE;
   // Add in the lfMember list size:
   Inc(Result, fieldListSize);
 end;
@@ -793,144 +809,35 @@ begin
   FTypesConverter.FCVTypeConvFixups.Add(inTypIdx);
 end;
 
-function DIMCON_Size(leaf, rank: UInt16; range: array of Int64): UInt16;
-var
-  I: Integer;
-begin
-  if leaf = LF_DIMCONLU then
-    // LF_DIMCONLU must have twice rank number of values in range
-    Assert(Length(range) = (rank shl 1))
-  else
-    // LF_DIMCONU has rank number of values in range
-    Assert(Length(range) = rank);
-  Result := SizeOf(lfDimCon) - SizeOf(PlfDimCon(nil).dim);
-  for I := 0 to Length(range) - 1 do
-    Inc(Result, SignedIntegerLeafCb(range[I]));
-end;
-
-procedure DIMCON_Fill(pOutLeaf: PlfDimCon; leaf: UInt16; typ: CV_typ_t; rank: UInt16;
-  range: array of Int64);
-var
-  I: Integer;
-  pData: PUInt8;
-begin
-  pOutLeaf.leaf := leaf;
-  pOutLeaf.typ := typ;
-  pOutLeaf.rank := rank;
-  pData := @pOutLeaf.dim[0];
-  for I := 0 to Length(range) - 1 do
-    pData := FillSignedIntegerLeaf(range[I], pData);
-end;
-
-function DIMARRAY_Size(name: PAnsiChar): UInt16;
-begin
-  Result := SizeOf(lfDimArray) - SizeOf(PlfDimArray(nil).name);
-  Inc(Result, System.AnsiStrings.StrLen(name) + 1);
-end;
-
-procedure DIMARRAY_Fill(pOutLeaf: PlfDimArray; elemtype, diminfo: CV_typ_t; name: PAnsiChar);
-var
-  pData: PAnsiChar;
-begin
-  pOutLeaf.leaf := LF_DIMARRAY;
-  pOutLeaf.utype := elemtype;
-  pOutLeaf.diminfo := diminfo;
-  pData := @pOutLeaf.name[0];
-  if name = nil then
-    pData^ := #0
-  else
-    System.AnsiStrings.StrCopy(pData, name);
-end;
-
 function TTDSToCVConverterDARRAY.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 var
   pInLeaf: PTDS_lfDArray;
-  pInRangedLeaf: PTDS_lfDRanged;
   pOutTyp: PTYPTYPE;
   typSize: UInt16;
-  dcluTyp: CV_typ_t;
   pData: PUInt8;
   arrSize: Int64;
-  DimLow,
-  DimHigh: Int64;
 begin
   pInLeaf := @pInTyp.leaf;
   pData := @pInLeaf.data[0];
   LeafSignedValue(pData, arrSize);
 
-  if (pInLeaf.rangetype < $1000) or
-     (FTypesConverter.FTDSParser.GlobalTypes[pInLeaf.rangetype].leaf <> TDS_LF_DRANGED) then begin
-    // non-ranged type, so just emit LF_ARRAY
-    if arrSize = -1 then
-      arrSize := 0;
-    typSize := SizeOf(pOutTyp.len) +
-      ARRAY_Size(
-        arrSize,
-        FTypesConverter.FTDSParser.Names[pInLeaf.name]);
-    Result := FTypesConverter.AddType(typSize, pOutTyp);
-    ARRAY_Fill(
-      @pOutTyp.leaf,
-      pInLeaf.elemtype,
-      pInLeaf.rangetype,
+  if arrSize = -1 then
+    arrSize := 0;
+  typSize := SizeOf(pOutTyp.len) +
+    ARRAY_Size(
       arrSize,
       FTypesConverter.FTDSParser.Names[pInLeaf.name]);
-    // Fixups
-    FTypesConverter.FCVTypeFixups.Add(@PlfArray(@pOutTyp.leaf).elemtype);
-  end
-  else begin
-    // Set up array dimension descriptor type based on Delphi ranged type
-    pInRangedLeaf := @FTypesConverter.FTDSParser.GlobalTypes[pInLeaf.rangetype].leaf;
-    Assert(pInRangedLeaf.leaf = TDS_LF_DRANGED);
-    if arrSize = -1 then begin
-      // Infinite array, so just emit LF_ARRAY of size 0 based on the range's underlying type
-      typSize := SizeOf(pOutTyp.len) +
-        ARRAY_Size(
-          0,
-          FTypesConverter.FTDSParser.Names[pInLeaf.name]);
-      Result := FTypesConverter.AddType(typSize, pOutTyp);
-      ARRAY_Fill(
-        @pOutTyp.leaf,
-        pInLeaf.elemtype,
-        pInRangedLeaf.utype,
-        0,
-        FTypesConverter.FTDSParser.Names[pInLeaf.name]);
-      // Fixups
-      FTypesConverter.FCVTypeFixups.Add(@PlfArray(@pOutTyp.leaf).elemtype);
-      FTypesConverter.FCVTypeFixups.Add(@PlfArray(@pOutTyp.leaf).idxtype);
-    end
-    else begin
-      pData := @pInRangedLeaf.data[0];
-      pData := LeafSignedValue(pData, DimLow);
-      LeafSignedValue(pData, DimHigh);
-      typSize := SizeOf(pOutTyp.len) +
-        DIMCON_Size(
-          LF_DIMCONLU,
-          1,
-          [DimLow, DimHigh]);
-      dcluTyp := FTypesConverter.AddType(typSize, pOutTyp);
-      DIMCON_Fill(
-        @pOutTyp.leaf,
-        LF_DIMCONLU,
-        pInRangedLeaf.utype,
-        1,
-        [DimLow, DimHigh]);
-      // Fixups
-      FTypesConverter.FCVTypeFixups.Add(@PlfDimCon(@pOutTyp.leaf).typ);
-
-      // Set up array type
-      typSize := SizeOf(pOutTyp.len) +
-        DIMARRAY_Size(
-          FTypesConverter.FTDSParser.Names[pInLeaf.name]);
-      Result := FTypesConverter.AddType(typSize, pOutTyp);
-      DIMARRAY_Fill(
-        @pOutTyp.leaf,
-        pInLeaf.elemtype,
-        dcluTyp,
-        FTypesConverter.FTDSParser.Names[pInLeaf.name]);
-      // Fixups
-      FTypesConverter.FCVTypeFixups.Add(@PlfDimArray(@pOutTyp.leaf).utype);
-    end;
-  end;
+  Result := FTypesConverter.AddType(typSize, pOutTyp);
+  ARRAY_Fill(
+    @pOutTyp.leaf,
+    pInLeaf.elemtype,
+    pInLeaf.rangetype,
+    arrSize,
+    FTypesConverter.FTDSParser.Names[pInLeaf.name]);
+  // Fixups
+  FTypesConverter.FCVTypeFixups.Add(@PlfArray(@pOutTyp.leaf).elemtype);
+  if pInLeaf.rangetype >= $1000 then
+    FTypesConverter.FCVTypeFixups.Add(@PlfArray(@pOutTyp.leaf).idxtype);
 end;
 
 function TTDSToCVConverterDSHORTSTR.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
@@ -1106,7 +1013,7 @@ begin
 end;
 
 function GenerateStringType(FTypesConverter: TTDSToPDBTypesConverter; chartype: CV_typ_t;
-  lengthOnly: Boolean): CV_typ_t;
+  lengthOnly: Boolean; predTypeName: AnsiString): CV_typ_t;
 const
   FIELD_codePage: AnsiString = 'codePage';
   FIELD_elemSize: AnsiString = 'elemSize';
@@ -1210,7 +1117,7 @@ begin
   typSize := SizeOf(pOutTyp.len) +
     CLASS_STRUCTURE_SIZE(
       structSize,
-      '');
+      PAnsiChar(predTypeName));
   structTyp := FTypesConverter.AddType(typSize, pOutTyp);
   CLASS_STRUCTURE_FILL(
     @pOutTyp.leaf,  // pOutLeaf
@@ -1220,7 +1127,7 @@ begin
     fieldTyp,       // field
     0,              // vshape
     structSize,     // instsize
-    '');  // name
+    PAnsiChar(predTypeName));  // name
 
   // Build LF_POINTER -> created LF_STRUCTURE
   typSize := SizeOf(pOutTyp.len) + POINTER_Size(False);
@@ -1235,7 +1142,10 @@ end;
 
 function TTDSToCVConverterDANSISTR.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 begin
-  Result := GenerateStringType(FTypesConverter, T_RCHAR, False);
+  if FTypesConverter.FPredefinedTypes.AnsiStr = 0 then
+    FTypesConverter.FPredefinedTypes.AnsiStr :=
+      GenerateStringType(FTypesConverter, T_RCHAR, False, '__PREDEFINED__AnsiStringRec');
+  Result := FTypesConverter.FPredefinedTypes.AnsiStr;
 end;
 
 function TTDSToCVConverterDVARIANT.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
@@ -1265,12 +1175,18 @@ end;
 
 function TTDSToCVConverterDWIDESTR.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 begin
-  Result := GenerateStringType(FTypesConverter, T_WCHAR, True);
+  if FTypesConverter.FPredefinedTypes.WideStr = 0 then
+    FTypesConverter.FPredefinedTypes.WideStr :=
+      GenerateStringType(FTypesConverter, T_WCHAR, True, '__PREDEFINED__WideStringRec');
+  Result := FTypesConverter.FPredefinedTypes.WideStr;
 end;
 
 function TTDSToCVConverterDUNISTR.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 begin
-  Result := GenerateStringType(FTypesConverter, T_WCHAR, False);
+  if FTypesConverter.FPredefinedTypes.UnicodeStr = 0 then
+    FTypesConverter.FPredefinedTypes.UnicodeStr :=
+      GenerateStringType(FTypesConverter, T_WCHAR, False, '__PREDEFINED__UnicodeStringRec');
+  Result := FTypesConverter.FPredefinedTypes.UnicodeStr;
 end;
 
 function ARGLIST_Size(count: UInt16): UInt16;
@@ -1430,9 +1346,27 @@ begin
   // padding not needed since this isn't variably sized and the record is already internally padded.
 end;
 
+function INDEX_Size: UInt16;
+begin
+  Result := SizeOf(lfIndex);
+end;
+
+procedure INDEX_Fill(pOutLeaf: PlfIndex; index: CV_typ_t);
+begin
+  pOutLeaf.leaf := LF_INDEX;
+  pOutLeaf.pad0 := 0;
+  pOutLeaf.index := index;
+end;
+
 function TTDSToCVConverterFIELDLIST.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 var
   pInLeaf: PTDS_lfFieldList;
+  typSizes: TQueue<UInt16>;
+  typCounts: TQueue<Integer>;
+  pIdxType: PCV_typ_t;
+  typCount,
+  cumulativeTypSize,
+  lastTypSize,
   typSize: UInt16;
   pOutTyp: PTYPTYPE;
   pInData,
@@ -1441,151 +1375,232 @@ var
   value: Int64;
   tempType: PTDS_TYPTYPE;
   ptrType: CV_typ_t;
+{$IFDEF DEBUG}
+  SizeList: TList<UInt16>;
+  SizeListCount: Integer;
+  pOutListLeafBase: Pointer;
+{$ENDIF}
 begin
 {$POINTERMATH ON}
   pInLeaf := PTDS_lfFieldList(@pInTyp.leaf);
   pEnd := PUInt8(@pInTyp.leaf) + pInTyp.len;
 
+{$IFDEF DEBUG}
+  SizeList := TList<UInt16>.Create;
+{$ENDIF}
   // Gather field list size
-  typSize := 0;
-  pInData := @pInLeaf.data[0];
-  while NativeUInt(pInData) < NativeUInt(pEnd) do begin
-    case PTDS_lfEasy(pInData).leaf of
-      TDS_LF_BCLASS:
-        Inc(typSize, BCLASS_Size);
-      TDS_LF_ENUMERATE: begin
-        LeafSignedValue(@PTDS_lfEnumerate(pInData).value[0], value);
-        Inc(typSize,
-          ENUMERATE_Size(
-            value,
-            FTypesConverter.FTDSParser.Names[PTDS_lfEnumerate(pInData).name]));
-      end;
-      TDS_LF_MEMBER: begin
-        // Ignore Delphi properties
-        if (PTDS_lfMember(pInData).index < $1000) or
-           (FTypesConverter.FTDSParser.GlobalTypes[PTDS_lfMember(pInData).index].leaf <> TDS_LF_DPROPERTY) then begin
-          LeafSignedValue(@PTDS_lfMember(pInData).offset[0], value);
-          Inc(typSize,
-            MEMBER_Size(
+  typSizes := nil;
+  typCounts := nil;
+  try
+    typSizes := TQueue<UInt16>.Create;
+    typCounts := TQueue<Integer>.Create;
+    cumulativeTypSize := 0;
+    lastTypSize := 0;
+    typCount := 0;
+    pInData := @pInLeaf.data[0];
+    while NativeUInt(pInData) < NativeUInt(pEnd) do begin
+      typSize := 0;
+      case PTDS_lfEasy(pInData).leaf of
+        TDS_LF_BCLASS:
+          typSize := BCLASS_Size;
+        TDS_LF_ENUMERATE: begin
+          LeafSignedValue(@PTDS_lfEnumerate(pInData).value[0], value);
+          typSize :=
+            ENUMERATE_Size(
               value,
-              FTypesConverter.FTDSParser.Names[PTDS_lfMember(pInData).name]));
+              FTypesConverter.FTDSParser.Names[PTDS_lfEnumerate(pInData).name]);
         end;
-      end;
-      TDS_LF_STMEMBER:
-        Inc(typSize,
-          STMEMBER_Size(
-            FTypesConverter.FTDSParser.Names[PTDS_lfSTMember(pInData).name]));
-      TDS_LF_METHOD:
-        Inc(typSize,
-          METHOD_Size(
-            FTypesConverter.FTDSParser.Names[PTDS_lfMethod(pInData).name]));
-      TDS_LF_VFUNCTAB:
-        Inc(typSize, VFUNCTAB_Size);
-    else
-      Assert(False);
-    end;
-    pInData := NextField(PTDS_lfEasy(pInData));
-  end;
-
-  typSize := SizeOf(pOutTyp.len) + FIELDLIST_Size(typSize);
-  Result := FTypesConverter.AddType(typSize, pOutTyp);
-
-  // Build CV field list
-  FIELDLIST_Fill(
-    @pOutTyp.leaf,
-    pOutListLeaf);
-  pInData := @pInLeaf.data[0];
-  while NativeUInt(pInData) < NativeUInt(pEnd) do begin
-    case PTDS_lfEasy(pInData).leaf of
-      TDS_LF_BCLASS: begin
-        // Fixups - must do before because of pOutListLeaf assignment
-        FTypesConverter.FCVTypeFixups.Add(@PlfBClass(pOutListLeaf).index);
-        pOutListLeaf :=
-          BCLASS_Fill(
-            pOutListLeaf,
-            PTDS_lfBClass(pInData).index);
-      end;
-      TDS_LF_ENUMERATE: begin
-        LeafSignedValue(@PTDS_lfEnumerate(pInData).value[0], value);
-        pOutListLeaf :=
-          ENUMERATE_Fill(
-            pOutListLeaf,
-            value,
-            FTypesConverter.FTDSParser.Names[PTDS_lfEnumerate(pInData).name]);
-      end;
-      TDS_LF_MEMBER: begin
-        // Ignore Delphi properties
-        if (PTDS_lfMember(pInData).index < $1000) or
-           (FTypesConverter.FTDSParser.GlobalTypes[PTDS_lfMember(pInData).index].leaf <> TDS_LF_DPROPERTY) then begin
-          // Fixups - must do before because of pOutListLeaf assignment
-          FTypesConverter.FCVTypeFixups.Add(@PlfMember(pOutListLeaf).index);
-          LeafSignedValue(@PTDS_lfMember(pInData).offset[0], value);
-          pOutListLeaf :=
-            MEMBER_Fill(
-              pOutListLeaf,
-              PTDS_lfMember(pInData).attr.access,
-              PTDS_lfMember(pInData).index,
-              value,
-              FTypesConverter.FTDSParser.Names[PTDS_lfMember(pInData).name]);
+        TDS_LF_MEMBER: begin
+          // Ignore Delphi properties
+          if (PTDS_lfMember(pInData).index < $1000) or
+             (FTypesConverter.FTDSParser.GlobalTypes[PTDS_lfMember(pInData).index].leaf <> TDS_LF_DPROPERTY) then begin
+            LeafSignedValue(@PTDS_lfMember(pInData).offset[0], value);
+            typSize :=
+              MEMBER_Size(
+                value,
+                FTypesConverter.FTDSParser.Names[PTDS_lfMember(pInData).name]);
+          end;
         end;
+        TDS_LF_STMEMBER:
+          typSize :=
+            STMEMBER_Size(
+              FTypesConverter.FTDSParser.Names[PTDS_lfSTMember(pInData).name]);
+        TDS_LF_METHOD:
+          typSize :=
+            METHOD_Size(
+              FTypesConverter.FTDSParser.Names[PTDS_lfMethod(pInData).name]);
+        TDS_LF_VFUNCTAB:
+          typSize := VFUNCTAB_Size;
+      else
+        Assert(False);
       end;
-      TDS_LF_STMEMBER: begin
-        // Fixups - must do before because of pOutListLeaf assignment
-        FTypesConverter.FCVTypeFixups.Add(@PlfSTMember(pOutListLeaf).index);
-        pOutListLeaf :=
-          STMEMBER_Fill(
-            pOutListLeaf,
-            PTDS_lfSTMember(pInData).attr.access,
-            PTDS_lfSTMember(pInData).index,
-            FTypesConverter.FTDSParser.Names[PTDS_lfSTMember(pInData).name]);
-      end;
-      TDS_LF_METHOD: begin
-        // Fixups - must do before because of pOutListLeaf assignment
-        FTypesConverter.FCVTypeFixups.Add(@PlfMethod(pOutListLeaf).mList);
-        pOutListLeaf :=
-          METHOD_Fill(
-            pOutListLeaf,
-            PTDS_lfMethod(pInData).count,
-            PTDS_lfMethod(pInData).mList,
-            FTypesConverter.FTDSParser.Names[PTDS_lfMethod(pInData).name]);
-      end;
-      TDS_LF_VFUNCTAB: begin
-        tempType := FTypesConverter.FTDSParser.GlobalTypes[PTDS_lfVFuncTab(pInData).&type];
-        Assert(tempType <> nil);
-        if tempType.leaf = TDS_LF_DMETACLASS then begin
-          // class type vfunctab
-          // Fixups - must do before because of pOutListLeaf assignment
-          FTypesConverter.FCVTypeFixups.Add(@PlfVFuncTab(pOutListLeaf).&type);
-          pOutListLeaf :=
-            VFUNCTAB_Fill(
-              pOutListLeaf,
-              PTDS_lfVFuncTab(pInData).&type);
+
+      if (FIELDLIST_Size_BASE + cumulativeTypSize + typSize) > High(UInt16) then begin
+        if (FIELDLIST_Size_BASE + cumulativeTypSize + INDEX_Size) > High(UInt16) then begin
+          typSizes.Enqueue(cumulativeTypSize - lastTypSize + INDEX_Size);
+          typCounts.Enqueue(typCount); // subtract last type, add index
+          cumulativeTypSize := lastTypSize + typSize;
+          lastTypSize := typSize;
+          typCount := 2;
         end
         else begin
-          // interface type vfunctab
-          Assert(tempType.leaf = TDS_LF_VTSHAPE);
-          // vfunctab never points directly to LF_VTSHAPE in codeview...instead it points to a
-          // pointer which then points to LF_VTSHAPE. Emit a pointer and then the vfunctab that
-          // points to it.
-          typSize := SizeOf(pOutTyp.len) + POINTER_Size(false);
-          ptrType := FTypesConverter.AddType(typSize, pOutTyp);
-          POINTER_Fill(
-            @pOutTyp.leaf,
-            PTDS_lfVFuncTab(pInData).&type,
-            CV_PTR_MODE_REF,
-            0, 0);
-          FTypesConverter.FCVTypeFixups.Add(@PlfPointer(@pOutTyp.leaf).utype);
-          pOutListLeaf :=
-            VFUNCTAB_Fill(
-              pOutListLeaf,
-              ptrType);
+          typSizes.Enqueue(cumulativeTypSize + INDEX_Size);
+          typCounts.Enqueue(typCount + 1);
+          cumulativeTypSize := typSize;
+          lastTypSize := typSize;
+          typCount := 1;
         end;
+      end
+      else begin
+        Inc(cumulativeTypSize, typSize);
+        lastTypSize := typSize;
+        Inc(typCount);
       end;
-    else
-      Assert(False);
+
+      pInData := NextField(PTDS_lfEasy(pInData));
+{$IFDEF DEBUG}
+      SizeList.Add(cumulativeTypSize);
+{$ENDIF}
     end;
-    pInData := NextField(PTDS_lfEasy(pInData));
+    typSizes.Enqueue(cumulativeTypSize);
+    typCounts.Enqueue(typCount);
+
+{$IFDEF DEBUG}
+    SizeListCount := 0;
+{$ENDIF}
+    Result := 0;
+    pIdxType := nil;
+    pInData := @pInLeaf.data[0];
+    repeat
+      cumulativeTypSize := typSizes.Dequeue;
+      typCount := typCounts.Dequeue;
+      typSize := SizeOf(pOutTyp.len) + FIELDLIST_Size(cumulativeTypSize);
+      if Result = 0 then
+        Result := FTypesConverter.AddType(typSize, pOutTyp)
+      else
+        pIdxType^ := FTypesConverter.AddType(typSize, pOutTyp);
+      // Build CV field list
+      FIELDLIST_Fill(
+        @pOutTyp.leaf,
+        pOutListLeaf);
+{$IFDEF DEBUG}
+      pOutListLeafBase := pOutListLeaf;
+{$ENDIF}
+
+      while (typCount > 0) and (NativeUInt(pInData) < NativeUInt(pEnd)) do begin
+        case PTDS_lfEasy(pInData).leaf of
+          TDS_LF_BCLASS: begin
+            // Fixups - must do before because of pOutListLeaf assignment
+            FTypesConverter.FCVTypeFixups.Add(@PlfBClass(pOutListLeaf).index);
+            pOutListLeaf :=
+              BCLASS_Fill(
+                pOutListLeaf,
+                PTDS_lfBClass(pInData).index);
+          end;
+          TDS_LF_ENUMERATE: begin
+            LeafSignedValue(@PTDS_lfEnumerate(pInData).value[0], value);
+            pOutListLeaf :=
+              ENUMERATE_Fill(
+                pOutListLeaf,
+                value,
+                FTypesConverter.FTDSParser.Names[PTDS_lfEnumerate(pInData).name]);
+          end;
+          TDS_LF_MEMBER: begin
+            // Ignore Delphi properties
+            if (PTDS_lfMember(pInData).index < $1000) or
+               (FTypesConverter.FTDSParser.GlobalTypes[PTDS_lfMember(pInData).index].leaf <> TDS_LF_DPROPERTY) then begin
+              // Fixups - must do before because of pOutListLeaf assignment
+              FTypesConverter.FCVTypeFixups.Add(@PlfMember(pOutListLeaf).index);
+              LeafSignedValue(@PTDS_lfMember(pInData).offset[0], value);
+              pOutListLeaf :=
+                MEMBER_Fill(
+                  pOutListLeaf,
+                  PTDS_lfMember(pInData).attr.access,
+                  PTDS_lfMember(pInData).index,
+                  value,
+                  FTypesConverter.FTDSParser.Names[PTDS_lfMember(pInData).name]);
+            end;
+          end;
+          TDS_LF_STMEMBER: begin
+            // Fixups - must do before because of pOutListLeaf assignment
+            FTypesConverter.FCVTypeFixups.Add(@PlfSTMember(pOutListLeaf).index);
+            pOutListLeaf :=
+              STMEMBER_Fill(
+                pOutListLeaf,
+                PTDS_lfSTMember(pInData).attr.access,
+                PTDS_lfSTMember(pInData).index,
+                FTypesConverter.FTDSParser.Names[PTDS_lfSTMember(pInData).name]);
+          end;
+          TDS_LF_METHOD: begin
+            // Fixups - must do before because of pOutListLeaf assignment
+            FTypesConverter.FCVTypeFixups.Add(@PlfMethod(pOutListLeaf).mList);
+            pOutListLeaf :=
+              METHOD_Fill(
+                pOutListLeaf,
+                PTDS_lfMethod(pInData).count,
+                PTDS_lfMethod(pInData).mList,
+                FTypesConverter.FTDSParser.Names[PTDS_lfMethod(pInData).name]);
+          end;
+          TDS_LF_VFUNCTAB: begin
+            tempType := FTypesConverter.FTDSParser.GlobalTypes[PTDS_lfVFuncTab(pInData).&type];
+            Assert(tempType <> nil);
+            if tempType.leaf = TDS_LF_DMETACLASS then begin
+              // class type vfunctab
+              // Fixups - must do before because of pOutListLeaf assignment
+              FTypesConverter.FCVTypeFixups.Add(@PlfVFuncTab(pOutListLeaf).&type);
+              pOutListLeaf :=
+                VFUNCTAB_Fill(
+                  pOutListLeaf,
+                  PTDS_lfVFuncTab(pInData).&type);
+            end
+            else begin
+              // interface type vfunctab
+              Assert(tempType.leaf = TDS_LF_VTSHAPE);
+              // vfunctab never points directly to LF_VTSHAPE in codeview...instead it points to a
+              // pointer which then points to LF_VTSHAPE. Emit a pointer and then the vfunctab that
+              // points to it.
+              typSize := SizeOf(pOutTyp.len) + POINTER_Size(false);
+              ptrType := FTypesConverter.AddType(typSize, pOutTyp);
+              POINTER_Fill(
+                @pOutTyp.leaf,
+                PTDS_lfVFuncTab(pInData).&type,
+                CV_PTR_MODE_REF,
+                0, 0);
+              FTypesConverter.FCVTypeFixups.Add(@PlfPointer(@pOutTyp.leaf).utype);
+              pOutListLeaf :=
+                VFUNCTAB_Fill(
+                  pOutListLeaf,
+                  ptrType);
+            end;
+          end;
+        else
+          Assert(False);
+        end;
+        Dec(typCount);
+
+        if (typCount = 1) and (typSizes.Count > 0) then begin
+          // emit index leaf and move on to next list
+          INDEX_Fill(pOutListLeaf, 0);
+          pIdxType := @PlfIndex(pOutListLeaf)^.index;
+          Dec(typCount);
+        end;
+
+        pInData := NextField(PTDS_lfEasy(pInData));
+{$IFDEF DEBUG}
+        Assert((NativeUInt(pOutListLeaf) - NativeUInt(pOutListLeafBase)) = SizeList[SizeListCount]);
+        Inc(SizeListCount);
+{$ENDIF}
+      end;
+    until typSizes.Count = 0;
+  finally
+    typCounts.Free;
+    typSizes.Free;
   end;
+
+{$IFDEF DEBUG}
+  SizeList.Free;
+{$ENDIF}
+
 {$POINTERMATH OFF}
 end;
 
@@ -1701,25 +1716,34 @@ begin
   AddConverter(TDS_LF_METHODLIST, 'TDS_LF_METHODLIST',  TTDSToCVConverterMETHODLIST.Create(Self));
 end;
 
-function TTDSToPDBTypesConverter.AddType(Size: UInt16; out pTyp: PTYPTYPE): CV_typ_t;
+function TTDSToPDBTypesConverter.AllocType(Size: UInt32): PTYPTYPE;
 begin
 {$POINTERMATH ON}
   // Pad Size to multiple of 4 for natural alignment
   if (Size and 3) > 0 then
     Inc(Size, 4 - (Size and 3));
 
-//  Assert(Size <= POOL_DELTA); - Always true
-  if (FBufferPool[FBufferPool.Count - 1].Position + Size) >=
-     FBufferPool[FBufferPool.Count - 1].Size then begin
+  if FBufferPool = nil then
+    FBufferPool := TObjectList<TMemoryStream>.Create;
+  if (FBufferPool.Count = 0) or
+     ((FBufferPool[FBufferPool.Count - 1].Position + Size) >=
+        FBufferPool[FBufferPool.Count - 1].Size) then begin
     FCurrentBuffer := TMemoryStream.Create;
     FCurrentBuffer.Size := POOL_DELTA;
     FBufferPool.Add(FCurrentBuffer);
   end;
-  pTyp := PTYPTYPE(PUInt8(FCurrentBuffer.Memory) + FCurrentBuffer.Position);
-  pTyp.len := Size - SizeOf(pTyp.len);
+  Result := PTYPTYPE(PUInt8(FCurrentBuffer.Memory) + FCurrentBuffer.Position);
+  FillChar(Result^, Size, 0);
+  Assert((Size - SizeOf(Result.len)) < High(UInt16));
+  Result.len := Size - SizeOf(Result.len);
   FCurrentBuffer.Position := FCurrentBuffer.Position + Size;
-  Result := FCVTypes.Add(pTyp);
 {$POINTERMATH OFF}
+end;
+
+function TTDSToPDBTypesConverter.AddType(Size: UInt32; out pTyp: PTYPTYPE): CV_typ_t;
+begin
+  pTyp := AllocType(Size);
+  Result := FCVTypes.Add(pTyp);
 end;
 
 procedure TTDSToPDBTypesConverter.Convert;
@@ -1727,11 +1751,6 @@ var
   I, J: Integer;
   currentType,
   newType: CV_typ_t;
-  typLen: UInt16;
-  TypeDataBase,
-  TypeDataCur: Pointer;
-  LogStream,
-  ConvLog: TStreamWriter;
   TDSType: TDS_typ_t;
   NewTypeList: TList<PTYPTYPE>;
   TranslatedTypes: TDictionary<CV_typ_t, CV_typ_t>;
@@ -1745,19 +1764,12 @@ begin
     FTypeConversions.Add(I, I);
 
   // Convert all types
-  ConvLog := TStreamWriter.Create(TFileStream.Create('ConvLog.txt', fmCreate or fmShareDenyWrite));
-  try
-    ConvLog.OwnStream;
-    if FTDSParser.GlobalTypes.Count > $1000 then // Only translate non-basic types
-      for I := $1000 to FTDSParser.GlobalTypes.Count - 1 do begin
-        newType := FTypeConverters[FTDSParser.GlobalTypes[I].leaf].Convert(I, FTDSParser.GlobalTypes[I]);
-        if newType <> 0 then
-          FTypeConversions.Add(I, newType);
-        ConvLog.WriteLine('$%.8x -> $%.8x (%s)', [I, newType, FTypeConverterNames[FTDSParser.GlobalTypes[I].leaf]]);
-      end;
-  finally
-    ConvLog.Free;
-  end;
+  if FTDSParser.GlobalTypes.Count > $1000 then // Only translate non-basic types
+    for I := $1000 to FTDSParser.GlobalTypes.Count - 1 do begin
+      newType := FTypeConverters[FTDSParser.GlobalTypes[I].leaf].Convert(I, FTDSParser.GlobalTypes[I]);
+      if newType <> 0 then
+        FTypeConversions.Add(I, newType);
+    end;
 
   // Fixup all assigned TDS types to CV types:
   if FCVTypeConvFixups.Count > 0 then begin
@@ -1790,33 +1802,41 @@ begin
       for I := FCVTypes.Count - 1 downto $1000 do
         TypesToProcess.Push(I);
 
-      LogStream := TStreamWriter.Create(TFileStream.Create('Reorderings.txt', fmCreate or fmShareDenyWrite));
-      try
-        LogStream.OwnStream;
-        while TypesToProcess.Count > 0 do begin
-          currentType := TypesToProcess.Peek; // Don't pop until we are ready to process it, or if we already have
-          if (not TranslatedTypes.TryGetValue(currentType, newType)) or (newType = 0) then begin
-            TranslatedTypes.AddOrSetValue(currentType, 0); // Not fully defined, but used to break dependency cycles
-            Dependencies := GetTypeDependencies(FCVTypes[currentType]);
-            PrevCount := TypesToProcess.Count;
-            if Length(Dependencies) > 0 then
-              for J := 0 to Length(Dependencies) - 1 do begin
-                Assert(Dependencies[J] < UInt32(FCVTypes.Count));
-                if (Dependencies[J] >= $1000) and
-                   (not TranslatedTypes.ContainsKey(Dependencies[J])) then
-                  TypesToProcess.Push(Dependencies[J]);
-              end;
-            if PrevCount = TypesToProcess.Count then begin // no unhandled dependencies
-              TypesToProcess.Pop;
-              TranslatedTypes[currentType] := NewTypeList.Add(FCVTypes[currentType]);
-              LogStream.WriteLine('$%.8x -> $%.8x', [currentType, NewTypeList.Count - 1]);
+      while TypesToProcess.Count > 0 do begin
+        currentType := TypesToProcess.Peek; // Don't pop until we are ready to process it, or if we already have
+        if (not TranslatedTypes.TryGetValue(currentType, newType)) or (newType = 0) then begin
+          TranslatedTypes.AddOrSetValue(currentType, 0); // Not fully defined, but used to break dependency cycles
+          Dependencies := GetTypeDependencies(FCVTypes[currentType]);
+          PrevCount := TypesToProcess.Count;
+          if Length(Dependencies) > 0 then
+            for J := 0 to Length(Dependencies) - 1 do begin
+              Assert(Dependencies[J] < UInt32(FCVTypes.Count));
+              // So this logic is goofy, but we push on type dependencies under the following
+              // conditions:
+              // 1) The dependency is a non-basic type (anything with index over $1000)
+              // 2) One of the following:
+              //   a) The dependency is not already in the stack to be processed
+              //   b) The current type is an LF_ARGLIST type and hasn't already been translated.
+              //      This must be important for some reason, because LLVM actually does a sanity
+              //      check to ensure all dependencies of LF_ARGLISTs have already been defined.
+              //      Depending on how we got here, it *may* result in duplicates being pushed on to
+              //      the TypesToProcess stack, but that's okay because duplicates will be ignored
+              //      in the check following the TypesToProcess.Peek() call above.
+//              if (Dependencies[J] >= $1000) and
+//                 (not TranslatedTypes.ContainsKey(Dependencies[J])) then
+//                TypesToProcess.Push(Dependencies[J]);
+              if (Dependencies[J] >= $1000) and
+                 ((not TranslatedTypes.TryGetValue(Dependencies[J], newType)) or
+                  ((FCVTypes[currentType]^.leaf = LF_ARGLIST) and (newType = 0))) then
+                TypesToProcess.Push(Dependencies[J]);
             end;
-          end
-          else
+          if PrevCount = TypesToProcess.Count then begin // no unhandled dependencies
             TypesToProcess.Pop;
-        end;
-      finally
-        LogStream.Free;
+            TranslatedTypes[currentType] := NewTypeList.Add(FCVTypes[currentType]);
+          end;
+        end
+        else
+          TypesToProcess.Pop;
       end;
     end;
     NewTypeList := AtomicExchange(Pointer(FCVTypes), Pointer(NewTypeList));
@@ -1832,54 +1852,104 @@ begin
         if (TDSType >= $1000) and (FTypeConversions[TDSType] >= $1000) then begin
           FTypeConversions[TDSType] := TranslatedTypes[FTypeConversions[TDSType]];
         end;
-    LogStream := TStreamWriter.Create(TFileStream.Create('ConvLogReordered.txt', fmCreate or fmShareDenyWrite));
-    try
-      LogStream.OwnStream;
-      if FTypeConversions.Count > $1000 then
-        for I := $1000 to FTypeConversions.Count - 1 do
-          if FTypeConversions.TryGetValue(I, newType) then
-            ConvLog.WriteLine('$%.8x -> $%.8x (%s)', [I, newType, FTypeConverterNames[FTDSParser.GlobalTypes[I].leaf]]);
-    finally
-      LogStream.Free;
-    end;
   finally
-    NewTypeList.Free; // Now should hold the old FGlobalTypes
+    NewTypeList.Free;
     TypesToProcess.Free;
     TranslatedTypes.Free;
   end;
 
-  // Merge type pool into one single buffer
-  FTypeData := TMemoryStream.Create;
-  FTypeData.Size := FBufferPool.Count * POOL_DELTA;
-  TypeDataBase := FTypeData.Memory;
-  TypeDataCur := TypeDataBase;
-  LogStream := TStreamWriter.Create(TFileStream.Create('DumpTypes.txt', fmCreate or fmShareDenyWrite));
-  LogStream.OwnStream;
+
+  // Old Code
+  {NewTypeList := TList<PTYPTYPE>.Create;
+  for I := 0 to $1000 - 1 do // add in basic types with nil PTYPTYPE
+    NewTypeList.Add(nil);
+  TranslatedTypes := TDictionary<CV_typ_t, CV_typ_t>.Create;
+  TypesToProcess := nil;
   try
+    // Sort types in reverse dependency order and keep track of changes
+    TypesToProcess := TStack<UInt32>.Create;
+    if FCVTypes.Count > $1000 then begin // process only non-basic types
+      for I := FCVTypes.Count - 1 downto $1000 do
+        TypesToProcess.Push(I);
+
+      while TypesToProcess.Count > 0 do begin
+        currentType := TypesToProcess.Peek; // Don't pop until we are ready to process it, or if we already have
+        if (not TranslatedTypes.TryGetValue(currentType, newType)) or (newType = 0) then begin
+          TranslatedTypes.AddOrSetValue(currentType, 0); // Not fully defined, but used to break dependency cycles
+          Dependencies := GetTypeDependencies(FCVTypes[currentType]);
+          PrevCount := TypesToProcess.Count;
+          if Length(Dependencies) > 0 then
+            for J := 0 to Length(Dependencies) - 1 do begin
+              Assert(Dependencies[J] < UInt32(FCVTypes.Count));
+              if (Dependencies[J] >= $1000) and
+                 (not TranslatedTypes.ContainsKey(Dependencies[J])) then
+                TypesToProcess.Push(Dependencies[J]);
+            end;
+          if PrevCount = TypesToProcess.Count then begin // no unhandled dependencies
+            TypesToProcess.Pop;
+            TranslatedTypes[currentType] := NewTypeList.Add(FCVTypes[currentType]);
+          end;
+        end
+        else
+          TypesToProcess.Pop;
+      end;
+    end;
+    NewTypeList := AtomicExchange(Pointer(FCVTypes), Pointer(NewTypeList));
+
+    // Update types within the types themselves
+    if FCVTypes.Count > $1000 then // process only non-basic types
+      for I := $1000 to FCVTypes.Count - 1 do
+        TranslateTypes(FCVTypes[I], TranslatedTypes);
+
+    // Now update type conversion list
+    if FTypeConversions.Count > $1000 then
+      for TDSType in FTypeConversions.Keys do
+        if (TDSType >= $1000) and (FTypeConversions[TDSType] >= $1000) then begin
+          FTypeConversions[TDSType] := TranslatedTypes[FTypeConversions[TDSType]];
+        end;
+  finally
+    NewTypeList.Free;
+    TypesToProcess.Free;
+    TranslatedTypes.Free;
+  end;}
+
+  ConsolidateTypes;
+{$POINTERMATH OFF}
+end;
+
+procedure TTDSToPDBTypesConverter.ConsolidateTypes;
+var
+  NewTypeData: TMemoryStream;
+  TypeDataBase,
+  TypeDataCur: Pointer;
+  I: Integer;
+  typLen: UInt16;
+  bufSize: NativeUInt;
+begin
+  // Merge type pool into one single buffer
+  NewTypeData := TMemoryStream.Create;
+  try
+    bufSize := 0;
+    if FCVTypes.Count > $1000 then
+      for I := $1000 to FCVTypes.Count - 1 do
+        Inc(bufSize, FCVTypes[I].len + SizeOf(FCVTypes[I].len));
+    NewTypeData.Size := bufSize;
+    TypeDataBase := NewTypeData.Memory;
+    TypeDataCur := TypeDataBase;
     if FCVTypes.Count > $1000 then
       for I := $1000 to FCVTypes.Count - 1 do begin
         typLen := FCVTypes[I].len + SizeOf(FCVTypes[I].len);
         Move(FCVTypes[I]^, TypeDataCur^, typLen);
         FCVTypes[I] := TypeDataCur;
-        LogStream.WriteLine(DumpType(I, FCVTypes[I]));
-        LogStream.WriteLine;
         Inc(PUInt8(TypeDataCur), typLen);
       end;
+    NewTypeData := AtomicExchange(Pointer(FTypeData), Pointer(NewTypeData));
+    FBufferPool.Free;
+    FBufferPool := nil;
+    FCurrentBuffer := nil;
   finally
-    LogStream.Free;
+    NewTypeData.Free;
   end;
-  FBufferPool.Free;
-  FBufferPool := nil;
-  FCurrentBuffer := nil;
-{$POINTERMATH OFF}
-end;
-
-procedure TTDSToPDBTypesConverter.OnTypeFixupAdd(Sender: TObject; const Item: PCV_typ_t;
-  Action: TCollectionNotification);
-begin
-//  if (Action = cnAdded) and (Item^ = $40DA) then asm
-//    INT 3
-//  end;
 end;
 
 constructor TTDSToPDBTypesConverter.Create(TDSParser: TTDSParser);
@@ -1890,16 +1960,11 @@ begin
   FTypeConversions := TDictionary<TDS_typ_t, CV_typ_t>.Create;
   FTypeConverters := TObjectDictionary<UInt16, TTDSToCVTypeConverterBase>.Create([doOwnsValues]);
   FTypeConverterNames := TDictionary<UInt16, string>.Create;
-  FBufferPool := TObjectList<TMemoryStream>.Create;
-  FCurrentBuffer := TMemoryStream.Create;
-  FCurrentBuffer.Size := POOL_DELTA;
-  FBufferPool.Add(FCurrentBuffer);
   FTDSParser := TDSParser;
   FCVTypes := TList<PTYPTYPE>.Create;
   for I := 0 to $1000 - 1 do // add in nil PTYPTYPEs for basic types
     FCVTypes.Add(nil);
   FCVTypeFixups := TList<PCV_typ_t>.Create;
-  FCVTypeFixups.OnNotify := OnTypeFixupAdd;
   FCVTypeConvFixups := TList<TDS_typ_t>.Create;
   FTypeData := nil;
   FTObjectRefType := 0;
@@ -1920,6 +1985,38 @@ begin
   FBufferPool.Free;
   FTypeData.Free;
   inherited Destroy;
+end;
+
+procedure TTDSToPDBTypesConverter.UpdateUDTNames(NameDict: TDictionary<CV_typ_t, UTF8String>);
+var
+  UDTPair: TPair<CV_typ_t, UTF8String>;
+  oldLeaf: PlfClass;
+  oldSize: UInt16;
+  newTyp: PTYPTYPE;
+begin
+  for UDTPair in NameDict do
+    if UDTPair.Key >= $1000 then begin
+      case FCVTypes[UDTPair.Key].leaf of
+        LF_CLASS,
+        LF_STRUCTURE: begin
+          oldLeaf := @FCVTypes[UDTPair.key].leaf;
+          oldSize := CLASS_STRUCTURE_Instsize(oldLeaf);
+          newTyp :=
+            AllocType(SizeOf(newTyp.len) + CLASS_STRUCTURE_Size(oldSize, PAnsiChar(UDTPair.Value)));
+          FCVTypes[UDTPair.Key] := newTyp;
+          CLASS_STRUCTURE_Fill(
+            @newTyp.leaf,
+            oldLeaf.leaf,
+            oldLeaf.count,
+            oldLeaf.&property.ctor <> 0,
+            oldLeaf.field,
+            oldLeaf.vshape,
+            oldSize,
+            PAnsiChar(UDTPair.Value));
+        end;
+      end;
+    end;
+  ConsolidateTypes;
 end;
 
 end.

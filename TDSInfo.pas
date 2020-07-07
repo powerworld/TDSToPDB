@@ -786,11 +786,11 @@ const
   TDS_S_CVRESERVE      = $0008; // Reserved for Code View internal use
   TDS_S_OBJNAME        = $0009; // Specify name of object file
 
-  TDS_S_GPROCINFO      = $0020; // Global section declared procedure
-  TDS_S_UNITDEPS       = $0024; // Unit dependencies?
-  TDS_S_UNITDEPSV2     = $0025; // Unit dependencies?
-  TDS_S_UNITDEPSV3     = $0026; // Unit dependencies?
-  TDS_S_SCOPEDCONST    = $0027; // Scoped constant symbol
+  TDS_S_GPROCREF       = $0020; // Global section procedure reference
+  TDS_S_USES           = $0024; // Uses list
+  TDS_S_NAMESPACE      = $0025; // Namespace list
+  TDS_S_USING          = $0026; // Units actually used
+  TDS_S_PCONST         = $0027; // Constant symbol
 
   TDS_S_BPREL16        = $0100; // BP relative 16:16
   TDS_S_LDATA16        = $0101; // Local data 16:16
@@ -818,9 +818,9 @@ const
   TDS_S_CEXMODEL32     = $020A; // Change execution model 16:32
   TDS_S_VFTPATH32      = $020B; // Virtual function table path descriptor 16:32
 
-  TDS_S_REGVALIDRANGE  = $0211; // Register variable valid range
+  TDS_S_OPTVAR32       = $0211; // Optimized variable
 
-  TDS_S_NESTEDPROCINFO = $0230; // Nested procedure information
+  TDS_S_SLINK32        = $0230; // Linked scope information
 
 type
   PTDS_SYMTYPE = ^TDS_SYMTYPE;
@@ -957,18 +957,18 @@ type
     reg: UInt16;
   end;
 
-  PTDS_REGVALIDRANGESYM = ^TDS_REGVALIDRANGESYM;
-  TDS_REGVALIDRANGESYM = packed record
+  PTDS_OPTVARSYM = ^TDS_OPTVARSYM;
+  TDS_OPTVARSYM = packed record
     reclen: UInt16;
-    rectyp: UInt16; // TDS_S_REGVALIDRANGE
+    rectyp: UInt16; // TDS_S_OPTVAR32
     cRanges: UInt16;
     ranges: array [0..0] of TDS_rvrRANGE;
   end;
 
-  PTDS_NESTPROCINFOSYM = ^TDS_NESTPROCINFOSYM;
-  TDS_NESTPROCINFOSYM = packed record
+  PTDS_SLINKSYM = ^TDS_SLINKSYM;
+  TDS_SLINKSYM = packed record
     reclen: UInt16;
-    rectyp: UInt16; // TDS_S_NESTEDPROCINFO
+    rectyp: UInt16; // TDS_S_SLINK32
     off: UInt32; // frame relative offset to outer frame pointer
   end;
 

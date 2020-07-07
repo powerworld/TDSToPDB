@@ -3,7 +3,8 @@ unit TDSSymbolsConv;
 interface
 
 uses
-  System.Classes, System.Generics.Collections, TDSInfo, CVInfo, TDSParser, TDSTypesConv;
+  System.Classes, System.Generics.Defaults, System.Generics.Collections, TDSInfo, CVInfo, TDSParser,
+  TDSTypesConv;
 
 //  Symbol conversions:
 //    TDS_S_COMPILE         ->  (nothing)
@@ -54,6 +55,7 @@ type
   private const
     POOL_DELTA = 256 * 1024;
   private
+    FPEImage: TPeBorTDSParserImage;
     FTDSParser: TTDSParser;
     FTypesConverter: TTDSToPDBTypesConverter;
     FBufferPool: TObjectList<TMemoryStream>;
@@ -61,27 +63,37 @@ type
     FSymbolData: TObjectList<TMemoryStream>;
     FSymbolConverters: TObjectDictionary<UInt16, TConverterInfo>;
     FCVSymbols: TObjectList<TList<PSYMTYPE>>;
+    FCVSymbolsSize: TList<UInt32>;
+    FCVProcs: TObjectList<TList<PPROCSYM32>>;
 
     FTDSSymOffToCVSymIdx: TDictionary<UInt32, Integer>;
     FCurrentCVSymbols: TList<PSYMTYPE>;
     FCurrentModule: Integer;
     FLastTDSSymbol: PTDS_SYMTYPE;
-    procedure AddConverters;
+    procedure AddConverters(Is64Bit: Boolean);
     function AddSymbol(Size: UInt16; out pSym: PSYMTYPE): UInt32;
     procedure Convert;
   public
-    constructor Create(TDSParser: TTDSParser; TypesConverter: TTDSToPDBTypesConverter);
+    constructor Create(PEImage: TPeBorTDSParserImage; TDSParser: TTDSParser;
+      TypesConverter: TTDSToPDBTypesConverter);
     destructor Destroy; override;
     property CVSymbols: TObjectList<TList<PSYMTYPE>> read FCVSymbols;
+    property CVSymbolsSize: TList<UInt32> read FCVSymbolsSize;
     property CVSymbolData: TObjectList<TMemoryStream> read FSymbolData;
+    property CVProcs: TObjectList<TList<PPROCSYM32>> read FCVProcs;
   end;
 
 implementation
 
 uses
-  System.AnsiStrings, System.Math, System.SysUtils, Range, CVConst;
+  System.AnsiStrings, System.Math, System.SysUtils, JclPeImage, Range, CVConst, TDSUtils;
 
 type
+  TTDSToCVSymConverterNoOperation = class(TTDSToCVTypeConverterBase)
+  public
+    function Convert(pInSym: PTDS_SYMTYPE): UInt32; override;
+  end;
+
   TTDSToCVSymConverterCOMPILE = class(TTDSToCVTypeConverterBase)
   public
     function Convert(pInSym: PTDS_SYMTYPE): UInt32; override;
@@ -107,27 +119,27 @@ type
     function Convert(pInSym: PTDS_SYMTYPE): UInt32; override;
   end;
 
-  TTDSToCVSymConverterGPROCINFO = class(TTDSToCVTypeConverterBase)
+  TTDSToCVSymConverterGPROCREF = class(TTDSToCVTypeConverterBase)
   public
     function Convert(pInSym: PTDS_SYMTYPE): UInt32; override;
   end;
 
-  TTDSToCVSymConverterUNITDEPS = class(TTDSToCVTypeConverterBase)
+  TTDSToCVSymConverterUSES = class(TTDSToCVTypeConverterBase)
   public
     function Convert(pInSym: PTDS_SYMTYPE): UInt32; override;
   end;
 
-  TTDSToCVSymConverterUNITDEPSV2 = class(TTDSToCVTypeConverterBase)
+  TTDSToCVSymConverterNAMESPACE = class(TTDSToCVTypeConverterBase)
   public
     function Convert(pInSym: PTDS_SYMTYPE): UInt32; override;
   end;
 
-  TTDSToCVSymConverterUNITDEPSV3 = class(TTDSToCVTypeConverterBase)
+  TTDSToCVSymConverterUSING = class(TTDSToCVTypeConverterBase)
   public
     function Convert(pInSym: PTDS_SYMTYPE): UInt32; override;
   end;
 
-  TTDSToCVSymConverterSCOPEDCONST = class(TTDSToCVTypeConverterBase)
+  TTDSToCVSymConverterPCONST = class(TTDSToCVTypeConverterBase)
   public
     function Convert(pInSym: PTDS_SYMTYPE): UInt32; override;
   end;
@@ -158,15 +170,21 @@ type
     function Convert(pInSym: PTDS_SYMTYPE): UInt32; override;
   end;
 
-  TTDSToCVSymConverterREGVALIDRANGE = class(TTDSToCVTypeConverterBase)
+  TTDSToCVSymConverterOPTVAR32 = class(TTDSToCVTypeConverterBase)
   public
     function Convert(pInSym: PTDS_SYMTYPE): UInt32; override;
   end;
 
-  TTDSToCVSymConverterNESTEDPROCINFO = class(TTDSToCVTypeConverterBase)
+  TTDSToCVSymConverterSLINK32 = class(TTDSToCVTypeConverterBase)
   public
     function Convert(pInSym: PTDS_SYMTYPE): UInt32; override;
   end;
+
+function TTDSToCVSymConverterNoOperation.Convert(pInSym: PTDS_SYMTYPE): UInt32;
+begin
+  // do nothing
+  Result := 0;
+end;
 
 function TTDSToCVSymConverterCOMPILE.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 begin
@@ -234,21 +252,24 @@ end;
 function TTDSToCVSymConverterREGISTER.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 var
   pTypedSym: PTDS_REGSYM;
-  symSize: UInt16;
   pOutSym: PREGSYM;
 begin
-  pTypedSym := PTDS_REGSYM(pInSym);
-  if pTypedSym.reg = 0 then
-    Exit(0); // will be followed by TDS_S_REGVALIDRANGE
-  symSize := SizeOf(pOutSym.reclen) +
-    REGISTER_Size(
+  // Currently local variables are only reliable in Win32
+  if FSymbolsConverter.FPEImage.Target = taWin32 then begin
+    pTypedSym := PTDS_REGSYM(pInSym);
+    if pTypedSym.reg = 0 then
+      Exit(0); // will be followed by TDS_S_REGVALIDRANGE
+    Result := FSymbolsConverter.AddSymbol(
+      REGISTER_Size(FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]),
+      PSYMTYPE(pOutSym));
+    REGISTER_Fill(
+      pOutSym,
+      FSymbolsConverter.FTypesConverter.TypeConversions[pTypedSym.typind],
+      pTypedSym.reg,
       FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]);
-  Result := FSymbolsConverter.AddSymbol(symSize, PSYMTYPE(pOutSym));
-  REGISTER_Fill(
-    pOutSym,
-    FSymbolsConverter.FTypesConverter.TypeConversions[pTypedSym.typind],
-    pTypedSym.reg,
-    FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]);
+  end
+  else
+    Result := 0;
 end;
 
 function UDT_Size(name: PAnsiChar): UInt16;
@@ -270,14 +291,12 @@ end;
 function TTDSToCVSymConverterUDT.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 var
   pTypedSym: PTDS_UDTSYM;
-  symSize: UInt16;
   pOutSym: PUDTSYM;
 begin
   pTypedSym := PTDS_UDTSYM(pInSym);
-  symSize := SizeOf(pOutSym.reclen) +
-    UDT_Size(
-      FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]);
-  Result := FSymbolsConverter.AddSymbol(symSize, PSYMTYPE(pOutSym));
+  Result := FSymbolsConverter.AddSymbol(
+    UDT_Size(FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]),
+    PSYMTYPE(pOutSym));
   UDT_Fill(
     pOutSym,
     FSymbolsConverter.FTypesConverter.TypeConversions[pTypedSym.typind],
@@ -299,12 +318,10 @@ end;
 function TTDSToCVSymConverterSSEARCH.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 var
   pTypedSym: PTDS_SEARCHSYM;
-  symSize: UInt16;
   pOutSym: PSEARCHSYM;
 begin
   pTypedSym := PTDS_SEARCHSYM(pInSym);
-  symSize := SizeOf(pOutSym.reclen) + SSEARCH_Size;
-  Result := FSymbolsConverter.AddSymbol(symSize, PSYMTYPE(pOutSym));
+  Result := FSymbolsConverter.AddSymbol(SSEARCH_Size, PSYMTYPE(pOutSym));
   SSEARCH_Fill(
     pOutSym,
     pTypedSym.startsym, // will be fixed up
@@ -323,39 +340,37 @@ end;
 
 function TTDSToCVSymConverterEND.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 var
-  symSize: UInt16;
   pOutSym: PSYMTYPE;
 begin
-  symSize := SizeOf(pOutSym.reclen) + END_Size;
-  Result := FSymbolsConverter.AddSymbol(symSize, pOutSym);
+  Result := FSymbolsConverter.AddSymbol(END_Size, pOutSym);
   END_Fill(pOutSym);
 end;
 
-function TTDSToCVSymConverterGPROCINFO.Convert(pInSym: PTDS_SYMTYPE): UInt32;
+function TTDSToCVSymConverterGPROCREF.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 begin
   // do nothing
   Result := 0;
 end;
 
-function TTDSToCVSymConverterUNITDEPS.Convert(pInSym: PTDS_SYMTYPE): UInt32;
+function TTDSToCVSymConverterUSES.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 begin
   // do nothing
   Result := 0;
 end;
 
-function TTDSToCVSymConverterUNITDEPSV2.Convert(pInSym: PTDS_SYMTYPE): UInt32;
+function TTDSToCVSymConverterNAMESPACE.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 begin
   // do nothing
   Result := 0;
 end;
 
-function TTDSToCVSymConverterUNITDEPSV3.Convert(pInSym: PTDS_SYMTYPE): UInt32;
+function TTDSToCVSymConverterUSING.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 begin
   // do nothing
   Result := 0;
 end;
 
-function TTDSToCVSymConverterSCOPEDCONST.Convert(pInSym: PTDS_SYMTYPE): UInt32;
+function TTDSToCVSymConverterPCONST.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 begin
   // do nothing
   Result := 0;
@@ -386,7 +401,7 @@ end;
 procedure DEFRANGE_FRAMEPOINTER_REL_FULL_SCOPE_Fill(pOutSym: PDEFRANGESYMFRAMEPOINTERREL_FULL_SCOPE;
   offFramePointer: CV_off32_t);
 begin
-  pOutSym.rectyp := S_DEFRANGE_FRAMEPOINTER_REL;
+  pOutSym.rectyp := S_DEFRANGE_FRAMEPOINTER_REL_FULL_SCOPE;
   pOutSym.offFramePointer := offFramePointer;
 end;
 
@@ -394,41 +409,43 @@ end;
 function TTDSToCVSymConverterBPREL32.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 var
   pTypedSym: PTDS_BPRELSYM;
-  symSize: UInt16;
   pOutSymBPRel: PBPRELSYM32;
   pOutSymLocal: PLOCALSYM;
   pOutSymDefRangeFramePtrRelFull: PDEFRANGESYMFRAMEPOINTERREL_FULL_SCOPE;
 begin
-  pTypedSym := PTDS_BPRELSYM(pInSym);
+  // Currently local variables are only reliable in Win32
+  if FSymbolsConverter.FPEImage.Target = taWin32 then begin
+    pTypedSym := PTDS_BPRELSYM(pInSym);
 
-  // write S_LOCAL
-  symSize := SizeOf(pOutSymLocal.reclen) +
-    LOCAL_Size(
+    // write S_LOCAL
+    FSymbolsConverter.AddSymbol(
+      LOCAL_Size(FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]),
+      PSYMTYPE(pOutSymLocal));
+    LOCAL_Fill(
+      pOutSymLocal,
+      FSymbolsConverter.FTypesConverter.TypeConversions[pTypedSym.typind],
       FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]);
-  FSymbolsConverter.AddSymbol(symSize, PSYMTYPE(pOutSymLocal));
-  LOCAL_Fill(
-    pOutSymLocal,
-    FSymbolsConverter.FTypesConverter.TypeConversions[pTypedSym.typind],
-    FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]);
 
-  // write S_DEFRANGE_FRAMEPOINTER_REL
-  symSize := SizeOf(pOutSymDefRangeFramePtrRelFull.reclen) +
-    DEFRANGE_FRAMEPOINTER_REL_FULL_SCOPE_Size;
-  FSymbolsConverter.AddSymbol(symSize, PSYMTYPE(pOutSymDefRangeFramePtrRelFull));
-  DEFRANGE_FRAMEPOINTER_REL_FULL_SCOPE_Fill(
-    pOutSymDefRangeFramePtrRelFull,
-    pTypedSym.off);
+    // write S_DEFRANGE_FRAMEPOINTER_REL
+    FSymbolsConverter.AddSymbol(
+      DEFRANGE_FRAMEPOINTER_REL_FULL_SCOPE_Size,
+      PSYMTYPE(pOutSymDefRangeFramePtrRelFull));
+    DEFRANGE_FRAMEPOINTER_REL_FULL_SCOPE_Fill(
+      pOutSymDefRangeFramePtrRelFull,
+      pTypedSym.off);
 
-  // write S_BPREL32
-  symSize := SizeOf(pOutSymBPRel.reclen) +
-    BPREL32_Size(
+    // write S_BPREL32
+    Result := FSymbolsConverter.AddSymbol(
+      BPREL32_Size(FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]),
+      PSYMTYPE(pOutSymBPRel));
+    BPREL32_Fill(
+      pOutSymBPRel,
+      pTypedSym.off,
+      FSymbolsConverter.FTypesConverter.TypeConversions[pTypedSym.typind],
       FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]);
-  Result := FSymbolsConverter.AddSymbol(symSize, PSYMTYPE(pOutSymBPRel));
-  BPREL32_Fill(
-    pOutSymBPRel,
-    pTypedSym.off,
-    FSymbolsConverter.FTypesConverter.TypeConversions[pTypedSym.typind],
-    FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]);
+  end
+  else
+    Result := 0;
 end;
 
 function DATA32_Size(name: PAnsiChar): UInt32;
@@ -453,14 +470,12 @@ end;
 function TTDSToCVSymConverterDATA32.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 var
   pTypedSym: PTDS_DATASYM;
-  symSize: UInt16;
   pOutSym: PDATASYM32;
 begin
   pTypedSym := PTDS_DATASYM(pInSym);
-  symSize := SizeOf(pOutSym.reclen) +
-    DATA32_Size(
-      FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]);
-  Result := FSymbolsConverter.AddSymbol(symSize, PSYMTYPE(pOutSym));
+  Result := FSymbolsConverter.AddSymbol(
+    DATA32_Size(FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]),
+    PSYMTYPE(pOutSym));
   DATA32_Fill(
     pOutSym,
     IfThen(pTypedSym.rectyp = TDS_S_GDATA32, S_GDATA32, S_LDATA32),
@@ -499,14 +514,12 @@ end;
 function TTDSToCVSymConverterPROC32.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 var
   pTypedSym: PTDS_PROCSYM;
-  symSize: UInt16;
   pOutSym: PPROCSYM32;
 begin
   pTypedSym := PTDS_PROCSYM(pInSym);
-  symSize := SizeOf(pOutSym.reclen) +
-    PROC32_Size(
-      FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]);
-  Result := FSymbolsConverter.AddSymbol(symSize, PSYMTYPE(pOutSym));
+  Result := FSymbolsConverter.AddSymbol(
+    PROC32_Size(FSymbolsConverter.FTDSParser.Names[pTypedSym.nameind]),
+    PSYMTYPE(pOutSym));
   PROC32_Fill(
     pOutSym,
     IfThen(pTypedSym.rectyp = TDS_S_GPROC32, S_GPROC32, S_LPROC32),
@@ -555,9 +568,9 @@ begin
     end;
 end;
 
-function TTDSToCVSymConverterREGVALIDRANGE.Convert(pInSym: PTDS_SYMTYPE): UInt32;
+function TTDSToCVSymConverterOPTVAR32.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 var
-  pTypedSym: PTDS_REGVALIDRANGESYM;
+  pTypedSym: PTDS_OPTVARSYM;
   pSymProc: PPROCSYM32;
   pTDSSymReg: PTDS_REGSYM;
   pOutSymLocal: PLOCALSYM;
@@ -569,95 +582,96 @@ var
   RangeArray: TArray<CV_LVAR_ADDR_RANGE>;
   GapArray: TArray<TArray<CV_LVAR_ADDR_GAP>>;
   ValidRangeSet: TUInt32RangeSet;
-  symSize: UInt16;
 begin
-  // Walk backward to find current proc symbol (S_GPROC32 or S_LPROC32) and last reg symbol
-  // (S_REGISTER).
-  pSymProc := nil;
-  for I := FSymbolsConverter.FCurrentCVSymbols.Count - 1 downto 0 do begin
-    if (FSymbolsConverter.FCurrentCVSymbols[I].rectyp = S_GPROC32) or
-       (FSymbolsConverter.FCurrentCVSymbols[I].rectyp = S_LPROC32) then begin
-      pSymProc := PPROCSYM32(FSymbolsConverter.FCurrentCVSymbols[I]);
-      Break;
-    end
-    else
-      // Must not reach an end symbol, otherwise we're drifting into another proc's scope
-      Assert(FSymbolsConverter.FCurrentCVSymbols[I].rectyp <> S_END);
-  end;
-  // Must be within a procedure context
-  Assert(pSymProc <> nil);
-  // Last TDS symbol must have been a register symbol
-  pTDSSymReg := PTDS_REGSYM(FSymbolsConverter.FLastTDSSymbol);
-  Assert(pTDSSymReg.rectyp = TDS_S_REGISTER);
-
-  pTypedSym := PTDS_REGVALIDRANGESYM(pInSym);
-
-  // Convert valid ranges into gapped ranges
-  CurrentReg := CV_REG_NONE;
-  for I := 0 to pTypedSym.cRanges - 1 do begin
-    if pTypedSym.ranges[I].reg <> CurrentReg then begin
-      // Convert completed valid range set into one range with a set of gaps
-      if CurrentReg <> CV_REG_NONE then begin
-        GenerateRegVarGapRanges(pSymProc, ValidRangeSet, RangeArray[Length(RangeArray) - 1],
-          GapArray[Length(GapArray) - 1]);
-        RegArray[Length(RegArray) - 1] := CurrentReg;
-      end;
-      CurrentReg := pTypedSym.ranges[I].reg;
-      SetLength(RegArray, Length(RegArray) + 1);
-      SetLength(RangeArray, Length(RangeArray) + 1);
-      SetLength(GapArray, Length(GapArray) + 1);
-      ValidRangeSet.Clear;
+  // Currently local variables are only reliable in Win32
+  if FSymbolsConverter.FPEImage.Target = taWin32 then begin
+    // Walk backward to find current proc symbol (S_GPROC32 or S_LPROC32) and last reg symbol
+    // (S_REGISTER).
+    pSymProc := nil;
+    for I := FSymbolsConverter.FCurrentCVSymbols.Count - 1 downto 0 do begin
+      if (FSymbolsConverter.FCurrentCVSymbols[I].rectyp = S_GPROC32) or
+         (FSymbolsConverter.FCurrentCVSymbols[I].rectyp = S_LPROC32) then begin
+        pSymProc := PPROCSYM32(FSymbolsConverter.FCurrentCVSymbols[I]);
+        Break;
+      end
+      else
+        // Must not reach an end symbol, otherwise we're drifting into another proc's scope
+        Assert(FSymbolsConverter.FCurrentCVSymbols[I].rectyp <> S_END);
     end;
-    if pTypedSym.ranges[I].len = 0 then // just go to the end of the proc
-      ValidRangeSet := ValidRangeSet or UInt32Range(pTypedSym.ranges[I].off, UInt32.MaxValue)
-    else
-      ValidRangeSet := ValidRangeSet or UInt32Range(pTypedSym.ranges[I].off,
-        pTypedSym.ranges[I].off + pTypedSym.ranges[I].len - 1);
-  end;
-  // Add last range
-  GenerateRegVarGapRanges(pSymProc, ValidRangeSet, RangeArray[Length(RangeArray) - 1],
-    GapArray[Length(GapArray) - 1]);
-  RegArray[Length(RegArray) - 1] := CurrentReg;
+    // Must be within a procedure context
+    Assert(pSymProc <> nil);
+    // Last TDS symbol must have been a register symbol
+    pTDSSymReg := PTDS_REGSYM(FSymbolsConverter.FLastTDSSymbol);
+    Assert(pTDSSymReg.rectyp = TDS_S_REGISTER);
 
-  // We should have *something* by now
-  Assert((Length(RegArray) <> 0) and (Length(RangeArray) <> 0) and (Length(GapArray) <> 0));
+    pTypedSym := PTDS_OPTVARSYM(pInSym);
 
-  // write S_LOCAL
-  symSize := SizeOf(pOutSymLocal.reclen) +
-    LOCAL_Size(
+    // Convert valid ranges into gapped ranges
+    CurrentReg := CV_REG_NONE;
+    for I := 0 to pTypedSym.cRanges - 1 do begin
+      if pTypedSym.ranges[I].reg <> CurrentReg then begin
+        // Convert completed valid range set into one range with a set of gaps
+        if CurrentReg <> CV_REG_NONE then begin
+          GenerateRegVarGapRanges(pSymProc, ValidRangeSet, RangeArray[Length(RangeArray) - 1],
+            GapArray[Length(GapArray) - 1]);
+          RegArray[Length(RegArray) - 1] := CurrentReg;
+        end;
+        CurrentReg := pTypedSym.ranges[I].reg;
+        SetLength(RegArray, Length(RegArray) + 1);
+        SetLength(RangeArray, Length(RangeArray) + 1);
+        SetLength(GapArray, Length(GapArray) + 1);
+        ValidRangeSet.Clear;
+      end;
+      if pTypedSym.ranges[I].len = 0 then // just go to the end of the proc
+        ValidRangeSet := ValidRangeSet or UInt32Range(pTypedSym.ranges[I].off, UInt32.MaxValue)
+      else
+        ValidRangeSet := ValidRangeSet or UInt32Range(pTypedSym.ranges[I].off,
+          pTypedSym.ranges[I].off + pTypedSym.ranges[I].len - 1);
+    end;
+    // Add last range
+    GenerateRegVarGapRanges(pSymProc, ValidRangeSet, RangeArray[Length(RangeArray) - 1],
+      GapArray[Length(GapArray) - 1]);
+    RegArray[Length(RegArray) - 1] := CurrentReg;
+
+    // We should have *something* by now
+    Assert((Length(RegArray) <> 0) and (Length(RangeArray) <> 0) and (Length(GapArray) <> 0));
+
+    // write S_LOCAL
+    FSymbolsConverter.AddSymbol(
+      LOCAL_Size(FSymbolsConverter.FTDSParser.Names[pTDSSymReg.nameind]),
+      PSYMTYPE(pOutSymLocal));
+    LOCAL_Fill(
+      pOutSymLocal,
+      FSymbolsConverter.FTypesConverter.TypeConversions[pTDSSymReg.typind],
       FSymbolsConverter.FTDSParser.Names[pTDSSymReg.nameind]);
-  FSymbolsConverter.AddSymbol(symSize, PSYMTYPE(pOutSymLocal));
-  LOCAL_Fill(
-    pOutSymLocal,
-    FSymbolsConverter.FTypesConverter.TypeConversions[pTDSSymReg.typind],
-    FSymbolsConverter.FTDSParser.Names[pTDSSymReg.nameind]);
 
-  // write one or more S_DEFRANGE_REGISTER
-  for I := 0 to Length(RegArray) - 1 do begin
-    symSize := SizeOf(pOutSymDefRangeReg.reclen) +
-      DEFRANGE_REGISTER_Size(
-        Length(GapArray[I]));
-    FSymbolsConverter.AddSymbol(symSize, PSYMTYPE(pOutSymDefRangeReg));
-    DEFRANGE_REGISTER_Fill(
-      pOutSymDefRangeReg,
-      RegArray[I],
-      RangeArray[I],
-      GapArray[I]);
-  end;
+    // write one or more S_DEFRANGE_REGISTER
+    for I := 0 to Length(RegArray) - 1 do begin
+      FSymbolsConverter.AddSymbol(
+        DEFRANGE_REGISTER_Size(Length(GapArray[I])),
+        PSYMTYPE(pOutSymDefRangeReg));
+      DEFRANGE_REGISTER_Fill(
+        pOutSymDefRangeReg,
+        RegArray[I],
+        RangeArray[I],
+        GapArray[I]);
+    end;
 
-  // write S_REGISTER
-  symSize := SizeOf(pOutSymReg.reclen) +
-    REGISTER_Size(
+    // write S_REGISTER
+    Result := FSymbolsConverter.AddSymbol(
+      REGISTER_Size(FSymbolsConverter.FTDSParser.Names[pTDSSymReg.nameind]),
+      PSYMTYPE(pOutSymReg));
+    REGISTER_FILL(
+      pOutSymReg,
+      FSymbolsConverter.FTypesConverter.TypeConversions[pTDSSymReg.typind],
+      RegArray[0],
       FSymbolsConverter.FTDSParser.Names[pTDSSymReg.nameind]);
-  Result := FSymbolsConverter.AddSymbol(symSize, PSYMTYPE(pOutSymReg));
-  REGISTER_FILL(
-    pOutSymReg,
-    FSymbolsConverter.FTypesConverter.TypeConversions[pTDSSymReg.typind],
-    RegArray[0],
-    FSymbolsConverter.FTDSParser.Names[pTDSSymReg.nameind]);
+  end
+  else
+    Result := 0;
 end;
 
-function TTDSToCVSymConverterNESTEDPROCINFO.Convert(pInSym: PTDS_SYMTYPE): UInt32;
+function TTDSToCVSymConverterSLINK32.Convert(pInSym: PTDS_SYMTYPE): UInt32;
 begin
   // do nothing
   Result := 0;
@@ -687,7 +701,7 @@ begin
     TDS_S_UDT:
       if (PTDS_UDTSYM(pInSym).props and $4) > 0 then
         Inc(FPublicCount);
-    TDS_S_SCOPEDCONST:
+    TDS_S_PCONST:
       if (PTDS_SCOPEDCONSTSYM(pInSym).props and $4) > 0 then
         Inc(FPublicCount);
   end;
@@ -700,34 +714,44 @@ begin
   FSize := 0;
 end;
 
-procedure TTDSToPDBSymbolsConverter.AddConverters;
+procedure TTDSToPDBSymbolsConverter.AddConverters(Is64Bit: Boolean);
 begin
   FSymbolConverters.Add(TDS_S_COMPILE, TConverterInfo.Create('TDS_S_COMPILE', TTDSToCVSymConverterCOMPILE.Create(Self)));
-  FSymbolConverters.Add(TDS_S_REGISTER, TConverterInfo.Create('TDS_S_REGISTER', TTDSToCVSymConverterREGISTER.Create(Self)));
+  if Is64Bit then
+    FSymbolConverters.Add(TDS_S_REGISTER, TConverterInfo.Create('TDS_S_REGISTER', TTDSToCVSymConverterNoOperation.Create(Self)))
+  else
+    FSymbolConverters.Add(TDS_S_REGISTER, TConverterInfo.Create('TDS_S_REGISTER', TTDSToCVSymConverterREGISTER.Create(Self)));
   FSymbolConverters.Add(TDS_S_UDT, TConverterInfo.Create('TDS_S_UDT', TTDSToCVSymConverterUDT.Create(Self)));
   FSymbolConverters.Add(TDS_S_SSEARCH, TConverterInfo.Create('TDS_S_SSEARCH', TTDSToCVSymConverterSSEARCH.Create(Self)));
   FSymbolConverters.Add(TDS_S_END, TConverterInfo.Create('TDS_S_END', TTDSToCVSymConverterEND.Create(Self)));
-  FSymbolConverters.Add(TDS_S_GPROCINFO, TConverterInfo.Create('TDS_S_GPROCINFO', TTDSToCVSymConverterGPROCINFO.Create(Self)));
-  FSymbolConverters.Add(TDS_S_UNITDEPS, TConverterInfo.Create('TDS_S_UNITDEPS', TTDSToCVSymConverterUNITDEPS.Create(Self)));
-  FSymbolConverters.Add(TDS_S_UNITDEPSV2, TConverterInfo.Create('TDS_S_UNITDEPSV2', TTDSToCVSymConverterUNITDEPSV2.Create(Self)));
-  FSymbolConverters.Add(TDS_S_UNITDEPSV3, TConverterInfo.Create('TDS_S_UNITDEPSV3', TTDSToCVSymConverterUNITDEPSV3.Create(Self)));
-  FSymbolConverters.Add(TDS_S_SCOPEDCONST, TConverterInfo.Create('TDS_S_SCOPEDCONST', TTDSToCVSymConverterSCOPEDCONST.Create(Self)));
-  FSymbolConverters.Add(TDS_S_BPREL32, TConverterInfo.Create('TDS_S_BPREL32', TTDSToCVSymConverterBPREL32.Create(Self)));
+  FSymbolConverters.Add(TDS_S_GPROCREF, TConverterInfo.Create('TDS_S_GPROCREF', TTDSToCVSymConverterGPROCREF.Create(Self)));
+  FSymbolConverters.Add(TDS_S_USES, TConverterInfo.Create('TDS_S_USES', TTDSToCVSymConverterUSES.Create(Self)));
+  FSymbolConverters.Add(TDS_S_NAMESPACE, TConverterInfo.Create('TDS_S_NAMESPACE', TTDSToCVSymConverterNAMESPACE.Create(Self)));
+  FSymbolConverters.Add(TDS_S_USING, TConverterInfo.Create('TDS_S_USING', TTDSToCVSymConverterUSING.Create(Self)));
+  FSymbolConverters.Add(TDS_S_PCONST, TConverterInfo.Create('TDS_S_PCONST', TTDSToCVSymConverterPCONST.Create(Self)));
+  if Is64Bit then
+    FSymbolConverters.Add(TDS_S_BPREL32, TConverterInfo.Create('TDS_S_BPREL32', TTDSToCVSymConverterNoOperation.Create(Self)))
+  else
+    FSymbolConverters.Add(TDS_S_BPREL32, TConverterInfo.Create('TDS_S_BPREL32', TTDSToCVSymConverterBPREL32.Create(Self)));
   FSymbolConverters.Add(TDS_S_LDATA32, TConverterInfo.Create('TDS_S_LDATA32', TTDSToCVSymConverterLDATA32.Create(Self)));
   FSymbolConverters.Add(TDS_S_GDATA32, TConverterInfo.Create('TDS_S_GDATA32', TTDSToCVSymConverterGDATA32.Create(Self)));
   FSymbolConverters.Add(TDS_S_LPROC32, TConverterInfo.Create('TDS_S_LPROC32', TTDSToCVSymConverterLPROC32.Create(Self)));
   FSymbolConverters.Add(TDS_S_GPROC32, TConverterInfo.Create('TDS_S_GPROC32', TTDSToCVSymConverterGPROC32.Create(Self)));
   FSymbolConverters.Add(TDS_S_WITH32, TConverterInfo.Create('TDS_S_WITH32', TTDSToCVSymConverterWITH32.Create(Self)));
-  FSymbolConverters.Add(TDS_S_REGVALIDRANGE, TConverterInfo.Create('TDS_S_REGVALIDRANGE', TTDSToCVSymConverterREGVALIDRANGE.Create(Self)));
-  FSymbolConverters.Add(TDS_S_NESTEDPROCINFO, TConverterInfo.Create('TDS_S_NESTEDPROCINFO', TTDSToCVSymConverterNESTEDPROCINFO.Create(Self)));
+  if Is64Bit then
+    FSymbolConverters.Add(TDS_S_OPTVAR32, TConverterInfo.Create('TDS_S_OPTVAR32', TTDSToCVSymConverterNoOperation.Create(Self)))
+  else
+    FSymbolConverters.Add(TDS_S_OPTVAR32, TConverterInfo.Create('TDS_S_OPTVAR32', TTDSToCVSymConverterOPTVAR32.Create(Self)));
+  FSymbolConverters.Add(TDS_S_SLINK32, TConverterInfo.Create('TDS_S_SLINK32', TTDSToCVSymConverterSLINK32.Create(Self)));
 end;
 
 function TTDSToPDBSymbolsConverter.AddSymbol(Size: UInt16; out pSym: PSYMTYPE): UInt32;
 begin
 {$POINTERMATH ON}
   // Pad Size to multiple of 4 for natural alignment
-  if (Size and 3) > 0 then
-    Inc(Size, 4 - (Size and 3));
+//  if (Size and 3) > 0 then
+//    Inc(Size, 4 - (Size and 3));
+  Size := PadSymLen(Size);
 
 //  Assert(Size <= POOL_DELTA); - Always true
   if (FBufferPool[FBufferPool.Count - 1].Position + Size) >=
@@ -737,6 +761,7 @@ begin
     FBufferPool.Add(FCurrentBuffer);
   end;
   pSym := PSYMTYPE(PUInt8(FCurrentBuffer.Memory) + FCurrentBuffer.Position);
+  FillChar(pSym^, Size, 0);
   pSym.reclen := Size - SizeOf(pSym.reclen);
   FCurrentBuffer.Position := FCurrentBuffer.Position + Size;
   Result := FCurrentCVSymbols.Add(pSym) + 1; // Make the minimum index 1, so 0 is a sentinel
@@ -751,23 +776,22 @@ var
   SymbolDataBase,
   SymbolDataCur: Pointer;
   CurrentSymbolData: TMemoryStream;
-  OldSymOffset: UInt32;
-  symFixup: PSYMTYPE;
-  LogStream: TStreamWriter;
+  CurrentCVSymbolsSize: UInt32;
   TempList: TList<UInt16>;
+  UDTNames: TDictionary<CV_typ_t, UTF8String>;
 begin
 {$POINTERMATH ON}
-  // Convert all align symbols
-  // First, loop through each module
-  for I := 0 to FTDSParser.AlignSymbols.Count - 1 do
-    if FTDSParser.AlignSymbols[I] <> nil then begin
-      LogStream := TStreamWriter.Create(
-        TFileStream.Create(Format('Stats-%.4x-%s.csv', [I, FTDSParser.Names[I]]),
-        fmCreate or fmShareDenyWrite));
-      LogStream.OwnStream;
-      try
+  UDTNames := TDictionary<CV_typ_t, UTF8String>.Create;
+  try
+    // Convert all align symbols
+    // First, loop through each module
+    for I := 0 to FTDSParser.AlignSymbols.Count - 1 do
+      if FTDSParser.AlignSymbols[I] <> nil then begin
         FCurrentCVSymbols := TList<PSYMTYPE>.Create;
         FCVSymbols.Add(FCurrentCVSymbols);
+        FCVSymbolsSize.Add(0); // Add dummy entry that will be updated
+        FCVProcs.Add(TList<PPROCSYM32>.Create);
+        CurrentCVSymbolsSize := 0;
 
         FCurrentModule := I;
         FLastTDSSymbol := nil;
@@ -778,9 +802,6 @@ begin
           FLastTDSSymbol := FTDSParser.AlignSymbols[I][J];
           if symIdx <> 0 then begin
             Dec(symIdx);
-//            LogStream.WriteLine('%0:d (0x%0:.8x) -> %1:d',
-//              [NativeUInt(FLastTDSSymbol) - NativeUInt(FTDSParser.AlignSymbolsBases[I]),
-//               symIdx]);
             FTDSSymOffToCVSymIdx.Add(NativeUInt(FLastTDSSymbol) -
               NativeUInt(FTDSParser.AlignSymbolsBases[I]), symIdx);
           end;
@@ -788,36 +809,51 @@ begin
 
         TempList := TList<UInt16>.Create(FSymbolConverters.Keys);
         TempList.Sort;
-        LogStream.WriteLine('Symbol,Count,Count Hex,Public,Public Hex,Size,Size Hex');
+  //        LogStream.WriteLine('Symbol,Count,Count Hex,Public,Public Hex,Size,Size Hex');
         for J := 0 to TempList.Count - 1 do
           with FSymbolConverters[TempList[J]] do begin
-            LogStream.WriteLine('%0:s,%1:d,"=""%1:.8x""",%2:d,"=""%2:.8x""",%3:d,"=""%3:.8x"""',
-              [FName, FCount, FPublicCount, FSize]);
+  //            LogStream.WriteLine('%0:s,%1:d,"=""%1:.8x""",%2:d,"=""%2:.8x""",%3:d,"=""%3:.8x"""',
+  //              [FName, FCount, FPublicCount, FSize]);
             Clear;
           end;
 
         // Merge type pool into one single buffer
         CurrentSymbolData := TMemoryStream.Create;
         FSymbolData.Add(CurrentSymbolData);
-        CurrentSymbolData.Size := SizeOf(TDS_SymbolSectionHeader) -
-          SizeOf(PTDS_SymbolSectionHeader(nil).data) + FBufferPool.Count * POOL_DELTA;
+        CurrentSymbolData.Size := SizeOf(UInt32) + FBufferPool.Count * POOL_DELTA;
         SymbolDataBase := CurrentSymbolData.Memory;
         SymbolDataCur := SymbolDataBase;
         // set proper symbol section signature
-        PTDS_SymbolSectionHeader(SymbolDataCur).sig := $00000001;
-        Inc(PUInt8(SymbolDataCur), SizeOf(PTDS_SymbolSectionHeader(SymbolDataCur).sig));
+        PUInt32(SymbolDataCur)^ := CV_SIGNATURE_C13;
+        Inc(PUInt8(SymbolDataCur), SizeOf(UInt32));
 
         if FCurrentCVSymbols.Count > 0 then
           for J := 0 to FCurrentCVSymbols.Count - 1 do begin
+            // move symbol into new buffer
             symLen := FCurrentCVSymbols[J].reclen + SizeOf(FCurrentCVSymbols[J].reclen);
             Move(FCurrentCVSymbols[J]^, SymbolDataCur^, symLen);
             FCurrentCVSymbols[J] := SymbolDataCur;
             Inc(PUInt8(SymbolDataCur), symLen);
+            Inc(CurrentCVSymbolsSize, symLen);
+
+            case FCurrentCVSymbols[J].rectyp of
+              // once moved, take note of S_LPROC32 and S_GPROC32 symbols as they will be used to
+              // figure out line information contributions later
+              S_LPROC32,
+              S_GPROC32: CVProcs[I].Add(PPROCSYM32(FCurrentCVSymbols[J]));
+              // Also keep track of UDT names corresponding with CV type indices
+              S_UDT:
+                with PUDTSYM(FCurrentCVSymbols[J])^ do
+                  UDTNames.AddOrSetValue(typind, UTF8String(PAnsiChar(@name[0])));
+            end;
           end;
         FBufferPool.Clear;
         FCurrentBuffer := TMemoryStream.Create;
         FCurrentBuffer.Size := POOL_DELTA;
         FBufferPool.Add(FCurrentBuffer);
+
+        // Set the module total symbol size
+        FCVSymbolsSize[FCVSymbolsSize.Count - 1] := CurrentCVSymbolsSize;
 
         // Fixup linked symbols. Only S_SSEARCH, S_LPROC32 and S_GPROC32 symbols need this, but
         // their startsym, pParent, pEnd and pNext pointers are initially set to the TDS symbol
@@ -848,9 +884,7 @@ begin
               if pEnd <> 0 then
                 pEnd := NativeUInt(FCurrentCVSymbols[FTDSSymOffToCVSymIdx[pEnd]]) -
                   NativeUInt(SymbolDataBase);
-              if pNext <> 0 then
-                pNext := NativeUInt(FCurrentCVSymbols[FTDSSymOffToCVSymIdx[pNext]]) -
-                  NativeUInt(SymbolDataBase);
+              pNext := 0; // not needed anymore
             end
           else if FCurrentCVSymbols[J].rectyp = S_SSEARCH then
             with PSEARCHSYM(FCurrentCVSymbols[J])^ do
@@ -861,14 +895,17 @@ begin
                 else
                   startsym := 0;
         FTDSSymOffToCVSymIdx.Clear;
-      finally
-        LogStream.Free;
+      end
+      else begin
+        Assert(I = 0); // Should only happen for non-existent module 0
+        FCVSymbols.Add(nil);
+        FCVProcs.Add(nil);
+        FCVSymbolsSize.Add(0);
       end;
-    end
-    else begin
-      Assert(I = 0); // Should only happen for non-existent module 0
-      FCVSymbols.Add(nil);
-    end;
+    FTypesConverter.UpdateUDTNames(UDTNames);
+  finally
+    UDTNames.Free;
+  end;
 
   FBufferPool.Free;
   FBufferPool := nil;
@@ -876,10 +913,11 @@ begin
 {$POINTERMATH OFF}
 end;
 
-constructor TTDSToPDBSymbolsConverter.Create(TDSParser: TTDSParser;
-  TypesConverter: TTDSToPDBTypesConverter);
+constructor TTDSToPDBSymbolsConverter.Create(PEImage: TPeBorTDSParserImage;
+  TDSParser: TTDSParser; TypesConverter: TTDSToPDBTypesConverter);
 begin
   inherited Create;
+  FPEImage := PEImage;
   FTDSParser := TDSParser;
   FTypesConverter := TypesConverter;
   FBufferPool := TObjectList<TMemoryStream>.Create;
@@ -890,9 +928,11 @@ begin
   FSymbolConverters := TObjectDictionary<UInt16, TConverterInfo>.Create;
   FTDSSymOffToCVSymIdx := TDictionary<UInt32, Integer>.Create;
   FCVSymbols := TObjectList<TList<PSYMTYPE>>.Create;
+  FCVSymbolsSize := TList<UInt32>.Create;
+  FCVProcs := TObjectList<TList<PPROCSYM32>>.Create;
   FCurrentCVSymbols := nil;
   FLastTDSSymbol := nil;
-  AddConverters;
+  AddConverters(PEImage.Target = taWin64);
   Convert;
 end;
 
@@ -902,6 +942,8 @@ begin
   FSymbolData.Free;
   FSymbolConverters.Free;
   FTDSSymOffToCVSymIdx.Free;
+  FCVProcs.Free;
+  FCVSymbolsSize.Free;
   FCVSymbols.Free;
   inherited Destroy;
 end;

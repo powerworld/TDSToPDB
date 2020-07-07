@@ -31,6 +31,9 @@ procedure TranslateTypesInListField(pLeaf: PlfEasy; TypeTranslation: TDictionary
 
 function DumpType(idx: CV_typ_t; pType: PTYPTYPE): string;
 
+function PadSymLen(BaseLen: Integer): Integer; inline;
+function PadTypLen(BaseLen: Integer): Integer; inline;
+
 implementation
 
 uses
@@ -129,6 +132,8 @@ begin
         System.AnsiStrings.StrLen(PAnsiChar(@PlfMethod(Input).Name[0])) + 1;
     LF_VFUNCTAB:
       Result := SizeOf(lfVFuncTab);
+    LF_INDEX:
+      Result := SizeOf(lfIndex);
   else
     Assert(False); // Shouldn't make it here
     Result := 0;
@@ -346,11 +351,14 @@ var
   pTypeEnd: PTYPTYPE;
 begin
 {$POINTERMATH ON}
+  // This is largely derived from discoverTypeIndices() in TypeIndexDiscover.cpp in LLVM
   case pType.leaf of
     LF_VTSHAPE: begin
+      // Good
       SetLength(Result, 0);
     end;
     LF_POINTER: begin
+      // Good
       if ((PlfPointer(@pType.leaf).attr.ptrmode = CV_PTR_MODE_PMEM) or
           (PlfPointer(@pType.leaf).attr.ptrmode = CV_PTR_MODE_PMFUNC)) then begin
         SetLength(Result, 2);
@@ -361,11 +369,13 @@ begin
       Result[0] := PlfPointer(@pType.leaf).utype;
     end;
     LF_PROCEDURE: begin
+      // Good
       SetLength(Result, 2);
       Result[0] := PlfProc(@pType.leaf).rvtype;
       Result[1] := PlfProc(@pType.leaf).arglist;
     end;
     LF_MFUNCTION: begin
+      // Good
       SetLength(Result, 4);
       Result[0] := PlfMFunc(@pType.leaf).rvtype;
       Result[1] := PlfMFunc(@pType.leaf).classtype;
@@ -373,12 +383,14 @@ begin
       Result[3] := PlfMFunc(@pType.leaf).arglist;
     end;
     LF_ARGLIST: begin
+      // Good
       SetLength(Result, PlfArgList(@pType.leaf).count);
       if PlfArgList(@pType.leaf).count > 0 then
         for I := 0 to PlfArgList(@pType.leaf).count - 1 do
           Result[I] := PlfArgList(@pType.leaf).arg[I];
     end;
     LF_FIELDLIST: begin
+      // Good
       pLeaf := @PlfFieldList(@pType.leaf).data[0];
       pTypeEnd := NextType(pType);
       SetLength(Result, 0);
@@ -393,6 +405,7 @@ begin
       SetLength(Result, I);
     end;
     LF_METHODLIST: begin
+      // Good
       pMethod := @PlfMethodList(@pType.leaf).mList[0];
       pTypeEnd := NextType(pType);
       SetLength(Result, 0);
@@ -407,40 +420,48 @@ begin
       SetLength(Result, I);
     end;
     LF_DIMCONLU: begin
+      // Good
       SetLength(Result, 1);
       Result[0] := PlfDimCon(@pType.leaf).typ;
     end;
     LF_BITFIELD: begin
+      // Good
       SetLength(Result, 1);
       Result[0] := PlfBitfield(@pType.leaf).&type;
     end;
     LF_ARRAY: begin
+      // Good
       SetLength(Result, 2);
       Result[0] := PlfArray(@pType.leaf).elemtype;
       Result[1] := PlfArray(@pType.leaf).idxtype;
     end;
     LF_CLASS: begin
+      // Good
       SetLength(Result, 3);
       Result[0] := PlfClass(@pType.leaf).field;
       Result[1] := PlfClass(@pType.leaf).derived;
       Result[2] := PlfClass(@pType.leaf).vshape;
     end;
     LF_STRUCTURE: begin
+      // Good
       SetLength(Result, 3);
       Result[0] := PlfStructure(@pType.leaf).field;
       Result[1] := PlfStructure(@pType.leaf).derived;
       Result[2] := PlfStructure(@pType.leaf).vshape;
     end;
     LF_UNION: begin
+      // Good
       SetLength(Result, 1);
       Result[0] := PlfUnion(@pType.leaf).field;
     end;
     LF_ENUM: begin
+      // Good
       SetLength(Result, 2);
       Result[0] := PlfEnum(@pType.leaf).utype;
       Result[1] := PlfEnum(@pType.leaf).field;
     end;
     LF_DIMARRAY: begin
+      // Good
       SetLength(Result, 2);
       Result[0] := PlfDimArray(@pType.leaf).utype;
       Result[1] := PlfDimArray(@pType.leaf).diminfo;
@@ -454,12 +475,19 @@ end;
 function GetListFieldDependency(Input: PlfEasy): CV_typ_t;
 begin
   case Input.leaf of
+    // Good
     LF_BCLASS: Result := PlfBClass(Input).index;
+    // Good
     LF_ENUMERATE: Result := 0; // no dependency
+    // Good
     LF_MEMBER: Result := PlfMember(Input).index;
+    // Good
     LF_STMEMBER: Result := PlfSTMember(Input).index;
+    // Good
     LF_METHOD: Result := PlfMethod(Input).mList;
+    // Good
     LF_VFUNCTAB: Result := PlfVFuncTab(Input).&type;
+    LF_INDEX: Result := PlfIndex(Input).index;
   else
     Assert(False); // Shouldn't reach here
     Result := 0;
@@ -599,6 +627,9 @@ begin
     LF_VFUNCTAB:
       if TypeTranslation.TryGetValue(PlfVFuncTab(pLeaf).&type, typeNew) then
         PlfVFuncTab(pLeaf).&type := typeNew;
+    LF_INDEX:
+      if TypeTranslation.TryGetValue(PlfIndex(pLeaf).index, typeNew) then
+        PlfIndex(pLeaf).index := typeNew;
   else
     Assert(False); // Shouldn't reach here
   end;
@@ -1417,6 +1448,22 @@ begin
     Assert(False); // Shouldn't reach here
   end;
 {$POINTERMATH OFF}
+end;
+
+function PadSymLen(BaseLen: Integer): Integer; inline;
+begin
+  if (BaseLen and 3) > 0 then
+    Result := BaseLen + 4 - (BaseLen and 3)
+  else
+    Result := BaseLen;
+end;
+
+function PadTypLen(BaseLen: Integer): Integer; inline;
+begin
+  if (BaseLen and 3) > 0 then
+    Result := BaseLen + 4 - (BaseLen and 3)
+  else
+    Result := BaseLen;
 end;
 
 end.

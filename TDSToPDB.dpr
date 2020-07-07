@@ -6,11 +6,8 @@ program TDSToPDB;
 
 uses
   System.SysUtils,
-  PDBInterface in 'PDBInterface.pas',
   CVInfo in 'CVInfo.pas',
   Main in 'Main.pas',
-  ThiscallInterceptor in 'ThiscallInterceptor.pas',
-  Utils in 'Utils.pas',
   TDSInfo in 'TDSInfo.pas',
   TDSTypesConv in 'TDSTypesConv.pas',
   CVConst in 'CVConst.pas',
@@ -18,7 +15,10 @@ uses
   TD32ToPDBResources in 'TD32ToPDBResources.pas',
   TDSUtils in 'TDSUtils.pas',
   TDSSymbolsConv in 'TDSSymbolsConv.pas',
-  Range in 'Range.pas';
+  Range in 'Range.pas',
+  LLVMPDBCOM_TLB in 'LLVMPDBCOM_TLB.pas',
+  Options in 'Options.pas',
+  PDBInfo in 'PDBInfo.pas';
 
 begin
   try
