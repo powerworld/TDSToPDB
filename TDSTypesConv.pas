@@ -219,7 +219,7 @@ type
     function Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t; override;
   end;
 
-function POINTER_Size(isPMEM: Boolean): UInt16;
+function POINTER_Size(isPMEM: Boolean): UInt32;
 begin
   Result := SizeOf(PlfPointer(nil).leaf) + SizeOf(PlfPointer(nil).utype) + SizeOf(PlfPointer(nil).attr);
   if isPMEM then begin
@@ -246,7 +246,7 @@ end;
 function TTDSToCVConverterPOINTER.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 var
   pInLeaf: PTDS_lfPointer;
-  typSize: UInt16;
+  typSize: UInt32;
   pOutTyp: PTYPTYPE;
 begin
   pInLeaf := PTDS_lfPointer(@pInTyp.leaf);
@@ -272,7 +272,7 @@ begin
     FTypesConverter.FTObjectRefType := inTypIdx;
 end;
 
-function CLASS_STRUCTURE_Size(instsize: UInt16; name: PAnsiChar): UInt16;
+function CLASS_STRUCTURE_Size(instsize: UInt16; name: PAnsiChar): UInt32;
 begin
   Result := SizeOf(lfClass) - SizeOf(PlfClass(nil).data);
   // Add instance size length
@@ -314,7 +314,7 @@ begin
     System.AnsiStrings.StrCopy(PAnsiChar(dataptr), name);
 end;
 
-function CLASS_STRUCTURE_Instsize(pInLeaf: PlfClass): UInt16;
+function CLASS_STRUCTURE_Instsize(pInLeaf: PlfClass): UInt32;
 var
   outInstSize: UInt64;
 begin
@@ -330,7 +330,7 @@ var
   pFieldLeaf: PTDS_lfFieldList;
   pFieldEntryLeaf: PTDS_lfEasy;
   pMetaClassLeaf: PTDS_lfDMetaClass;
-  typSize: UInt16;
+  typSize: UInt32;
   pOutTyp: PTYPTYPE;
   outLeaf: UInt16;
   vshape: TDS_typ_t;
@@ -396,7 +396,7 @@ begin
     FTypesConverter.FTVarDataType := inTypIdx;
 end;
 
-function ENUM_Size(name: PAnsiChar): UInt16;
+function ENUM_Size(name: PAnsiChar): UInt32;
 begin
   Result := SizeOf(lfEnum) - SizeOf(PlfEnum(nil).Name);
   // Add sz name length
@@ -419,7 +419,7 @@ end;
 function TTDSToCVConverterENUM.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 var
   pInLeaf: PTDS_lfEnum;
-  typSize: UInt16;
+  typSize: UInt32;
   pOutTyp: PTYPTYPE;
 begin
   pInLeaf := PTDS_lfEnum(@pInTyp.leaf);
@@ -436,7 +436,7 @@ begin
   FTypesConverter.FCVTypeFixups.Add(@PlfEnum(@pOutTyp.leaf).field);
 end;
 
-function PROCEDURE_Size: UInt16;
+function PROCEDURE_Size: UInt32;
 begin
   Result := SizeOf(lfProc);
 end;
@@ -455,7 +455,7 @@ end;
 function TTDSToCVConverterPROCEDURE.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 var
   pInLeaf: PTDS_lfProc;
-  typSize: UInt16;
+  typSize: UInt32;
   pOutTyp: PTYPTYPE;
 begin
   pInLeaf := PTDS_lfProc(@pInTyp.leaf);
@@ -473,7 +473,7 @@ begin
   FTypesConverter.FCVTypeFixups.Add(@PlfProc(@pOutTyp.leaf).arglist);
 end;
 
-function MFUNCTION_Size: UInt16;
+function MFUNCTION_Size: UInt32;
 begin
   Result := SizeOf(lfMFunc)
 end;
@@ -495,7 +495,7 @@ end;
 function TTDSToCVConverterMFUNCTION.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 var
   pInLeaf: PTDS_lfMFunc;
-  typSize: UInt16;
+  typSize: UInt32;
   pOutTyp: PTYPTYPE;
 begin
   pInLeaf := PTDS_lfMFunc(@pInTyp.leaf);
@@ -517,7 +517,7 @@ begin
   FTypesConverter.FCVTypeFixups.Add(@PlfMFunc(@pOutTyp.leaf).arglist);
 end;
 
-function VTSHAPE_Size(count: UInt16): UInt16;
+function VTSHAPE_Size(count: UInt16): UInt32;
 begin
   Result := SizeOf(lfVTShape) - SizeOf(PlfVTShape(nil).desc);
   // Add desc array length, rounding up (4 bits per entry)
@@ -541,7 +541,7 @@ end;
 function TTDSToCVConverterVTSHAPE.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 var
   pInLeaf: PTDS_lfVTShape;
-  typSize: UInt16;
+  typSize: UInt32;
   pOutTyp: PTYPTYPE;
 begin
   pInLeaf := PTDS_lfVTShape(@pInTyp.leaf);
@@ -555,7 +555,7 @@ begin
     @pInLeaf.desc[0]);
 end;
 
-function BITFIELD_Size: UInt16;
+function BITFIELD_Size: UInt32;
 begin
   Result := SizeOf(lfBitfield);
 end;
@@ -568,13 +568,13 @@ begin
   pOutLeaf.position := position;
 end;
 
-procedure PadSize(var size: UInt16);
+procedure PadSize(var size: UInt32);
 begin
   if (size and 3) > 0 then
     Inc(size, 4 - (size and 3));
 end;
 
-function MEMBER_Size(offset: Int64; name: PAnsiChar): UInt16;
+function MEMBER_Size(offset: Int64; name: PAnsiChar): UInt32;
 begin
   // Add in the lfMember size minus the dummy data field size:
   Result := SizeOf(lfMember) - SizeOf(PlfMember(nil).offset);
@@ -614,12 +614,12 @@ begin
   PadBuffer(Result);
 end;
 
-function FIELDLIST_Size_BASE: UInt16;
+function FIELDLIST_Size_BASE: UInt32;
 begin
   Result := SizeOf(lfFieldList) - SizeOf(PlfFieldList(nil).data);
 end;
 
-function FIELDLIST_Size(fieldListSize: UInt16): UInt16;
+function FIELDLIST_Size(fieldListSize: UInt16): UInt32;
 begin
   Result := FIELDLIST_Size_BASE;
   // Add in the lfMember list size:
@@ -632,7 +632,7 @@ begin
   pOutListLeaf := @pOutLeaf.data[0];
 end;
 
-function ARRAY_Size(size: UInt64; name: PAnsiChar): UInt16;
+function ARRAY_Size(size: UInt64; name: PAnsiChar): UInt32;
 begin
   Result := SizeOf(lfArray) - SizeOf(PlfArray(nil).data);
   // Add in array size
@@ -664,11 +664,11 @@ var
   tdsElFieldsTyp: PTDS_TYPTYPE;
   tdsElField: PTDS_lfEnumerate;
   tdsElFieldEnd: Pointer;
-  typSize: UInt16;
+  typSize: UInt32;
   pOutTyp: PTYPTYPE;
   pOutListLeaf: Pointer;
   structFieldsTyp: CV_typ_t;
-  fieldListTypSize: UInt16;
+  fieldListTypSize: UInt32;
   fieldSize,
   fieldCount: UInt16;
 begin
@@ -813,7 +813,7 @@ function TTDSToCVConverterDARRAY.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTY
 var
   pInLeaf: PTDS_lfDArray;
   pOutTyp: PTYPTYPE;
-  typSize: UInt16;
+  typSize: UInt32;
   pData: PUInt8;
   arrSize: Int64;
 begin
@@ -850,7 +850,7 @@ var
   pOutTyp: PTYPTYPE;
   typCharArr: CV_typ_t;
   typStructFields: CV_typ_t;
-  typSize: UInt16;
+  typSize: UInt32;
   pOutListLeaf: Pointer;
 begin
   pInLeaf := @pInTyp.leaf;
@@ -925,7 +925,7 @@ var
   mFuncTyp,
   ptrTyp,
   fieldTyp: CV_typ_t;
-  typSize: UInt16;
+  typSize: UInt32;
   pOutListLeaf: Pointer;
 begin
   pInLeaf := @pInTyp.leaf;
@@ -1024,7 +1024,7 @@ var
   arrTyp,
   fieldTyp,
   structTyp: CV_typ_t;
-  typSize: UInt16;
+  typSize: UInt32;
   pOutTyp: PTYPTYPE;
   pOutListLeaf: Pointer;
   structSize: Int64;
@@ -1158,7 +1158,7 @@ end;
 function TTDSToCVConverterDMETACLASS.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 var
   pInLeaf: PTDS_lfDMetaClass;
-  typSize: UInt16;
+  typSize: UInt32;
   pOutTyp: PTYPTYPE;
 begin
   pInLeaf := PTDS_lfDMetaClass(@pInTyp.leaf);
@@ -1189,7 +1189,7 @@ begin
   Result := FTypesConverter.FPredefinedTypes.UnicodeStr;
 end;
 
-function ARGLIST_Size(count: UInt16): UInt16;
+function ARGLIST_Size(count: UInt16): UInt32;
 begin
   Result := SizeOf(lfArgList) - SizeOf(PlfArgList(nil).arg);
   Inc(Result, count * SizeOf(CV_typ_t));
@@ -1210,7 +1210,7 @@ end;
 function TTDSToCVConverterARGLIST.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 var
   pInLeaf: PTDS_lfArgList;
-  typSize: UInt16;
+  typSize: UInt32;
   pOutTyp: PTYPTYPE;
   I: UInt16;
   arg: TArray<CV_typ_t>;
@@ -1232,7 +1232,7 @@ begin
       FTypesConverter.FCVTypeFixups.Add(@PlfArgList(@pOutTyp.leaf).arg[I]);
 end;
 
-function BCLASS_Size: UInt16;
+function BCLASS_Size: UInt32;
 begin
   Result := SizeOf(lfBClass) - SizeOf(PlfBClass(nil).offset);
   Inc(Result, SignedIntegerLeafCb(0));
@@ -1253,7 +1253,7 @@ begin
   PadBuffer(Result); // need to pad field lists
 end;
 
-function ENUMERATE_Size(value: Int64; name: PAnsiChar): UInt16;
+function ENUMERATE_Size(value: Int64; name: PAnsiChar): UInt32;
 begin
   Result := SizeOf(lfEnumerate) - SizeOf(PlfEnumerate(nil).value);
   Inc(Result, SignedIntegerLeafCb(value));
@@ -1280,7 +1280,7 @@ begin
   PadBuffer(Result);
 end;
 
-function STMEMBER_Size(name: PAnsiChar): UInt16;
+function STMEMBER_Size(name: PAnsiChar): UInt32;
 begin
   Result := SizeOf(lfSTMember) - SizeOf(PlfSTMember(nil).Name);
   Inc(Result, System.AnsiStrings.StrLen(name) + 1);
@@ -1306,7 +1306,7 @@ begin
   PadBuffer(Result); // need to pad field lists
 end;
 
-function METHOD_Size(name: PAnsiChar): UInt16;
+function METHOD_Size(name: PAnsiChar): UInt32;
 begin
   Result := SizeOf(lfMember) - SizeOf(PlfMethod(nil).Name);
   Inc(Result, System.AnsiStrings.StrLen(name) + 1);
@@ -1331,7 +1331,7 @@ begin
   PadBuffer(Result); // need to pad field lists
 end;
 
-function VFUNCTAB_Size: UInt16;
+function VFUNCTAB_Size: UInt32;
 begin
   Result := SizeOf(lfVFuncTab);
 end;
@@ -1346,7 +1346,7 @@ begin
   // padding not needed since this isn't variably sized and the record is already internally padded.
 end;
 
-function INDEX_Size: UInt16;
+function INDEX_Size: UInt32;
 begin
   Result := SizeOf(lfIndex);
 end;
@@ -1361,13 +1361,13 @@ end;
 function TTDSToCVConverterFIELDLIST.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 var
   pInLeaf: PTDS_lfFieldList;
-  typSizes: TQueue<UInt16>;
+  typSizes: TQueue<UInt32>;
   typCounts: TQueue<Integer>;
   pIdxType: PCV_typ_t;
-  typCount,
+  typCount: UInt16;
   cumulativeTypSize,
   lastTypSize,
-  typSize: UInt16;
+  typSize: UInt32;
   pOutTyp: PTYPTYPE;
   pInData,
   pOutListLeaf,
@@ -1376,7 +1376,7 @@ var
   tempType: PTDS_TYPTYPE;
   ptrType: CV_typ_t;
 {$IFDEF DEBUG}
-  SizeList: TList<UInt16>;
+  SizeList: TList<UInt32>;
   SizeListCount: Integer;
   pOutListLeafBase: Pointer;
 {$ENDIF}
@@ -1386,13 +1386,13 @@ begin
   pEnd := PUInt8(@pInTyp.leaf) + pInTyp.len;
 
 {$IFDEF DEBUG}
-  SizeList := TList<UInt16>.Create;
+  SizeList := TList<UInt32>.Create;
 {$ENDIF}
   // Gather field list size
   typSizes := nil;
   typCounts := nil;
   try
-    typSizes := TQueue<UInt16>.Create;
+    typSizes := TQueue<UInt32>.Create;
     typCounts := TQueue<Integer>.Create;
     cumulativeTypSize := 0;
     lastTypSize := 0;
@@ -1435,8 +1435,8 @@ begin
         Assert(False);
       end;
 
-      if (FIELDLIST_Size_BASE + cumulativeTypSize + typSize) > High(UInt16) then begin
-        if (FIELDLIST_Size_BASE + cumulativeTypSize + INDEX_Size) > High(UInt16) then begin
+      if (FIELDLIST_Size_BASE + cumulativeTypSize + typSize) > (1 shl 16) then begin
+        if (FIELDLIST_Size_BASE + cumulativeTypSize + INDEX_Size) > (1 shl 16) then begin
           typSizes.Enqueue(cumulativeTypSize - lastTypSize + INDEX_Size);
           typCounts.Enqueue(typCount); // subtract last type, add index
           cumulativeTypSize := lastTypSize + typSize;
@@ -1604,7 +1604,7 @@ begin
 {$POINTERMATH OFF}
 end;
 
-function METHODLIST_Size(count, cVirtuals: Integer): UInt16;
+function METHODLIST_Size(count, cVirtuals: Integer): UInt32;
 begin
   Result := SizeOf(lfMethodList) - SizeOf(PlfMethodList(nil).mList);
   Inc(Result, count * (SizeOf(mlMethod) - SizeOf(PmlMethod(nil).vbaseoff)));
@@ -1635,7 +1635,7 @@ end;
 function TTDSToCVConverterMETHODLIST.Convert(inTypIdx: TDS_typ_t; pInTyp: PTDS_TYPTYPE): CV_typ_t;
 var
   pInLeaf: PTDS_lfMethodList;
-  typSize: UInt16;
+  typSize: UInt32;
   pOutTyp: PTYPTYPE;
   pEnd: PUInt8;
   pTDSMeth: PTDS_mlMethod;
@@ -1933,7 +1933,7 @@ procedure TTDSToPDBTypesConverter.UpdateUDTNames(NameDict: TDictionary<CV_typ_t,
 var
   UDTPair: TPair<CV_typ_t, UTF8String>;
   oldLeaf: PlfClass;
-  oldSize: UInt16;
+  oldSize: UInt32;
   newTyp: PTYPTYPE;
 begin
   for UDTPair in NameDict do

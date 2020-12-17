@@ -1366,8 +1366,6 @@ begin
 
     CreatePDB(BuildId, ParserImage, TypesConverter, SymbolsConverter);
     ExecutableSize := StripExecutableAndAddGUID(ParserImage, BuildId);
-//    BuildPDB(ParserImage.TDSParser, TypesConverter, SymbolsConverter, PDBGUID);
-//    ExecutableSize := StripExecutableAndAddGUID(ParserImage, PDBGUID);
   finally
     FreeMem(BuildId);
     SymbolsConverter.Free;
